@@ -194,23 +194,7 @@ function assert(p, message) {
 }
 
 const { validateObject, kValidateObjectAllowArray } = require("internal/validators");
-
-const SymbolToPrimitive = Symbol.toPrimitive;
-
-// Node.js computes this from `globalThis` at bootstrap, before any host globals
-// (Buffer, URL, ...) are installed. Bun's globalThis already has them when this
-// module loads, so hardcode the names Node observes instead of scraping.
-// prettier-ignore
-const builtInObjects = new SafeSet([
-  "AggregateError", "Array", "ArrayBuffer", "Atomics", "BigInt", "BigInt64Array",
-  "BigUint64Array", "Boolean", "DataView", "Date", "Error", "EvalError",
-  "FinalizationRegistry", "Float32Array", "Float64Array", "Function", "Infinity",
-  "Int16Array", "Int32Array", "Int8Array", "Intl", "Iterator", "JSON", "Map",
-  "Math", "NaN", "Number", "Object", "Promise", "Proxy", "RangeError",
-  "ReferenceError", "Reflect", "RegExp", "Set", "String", "Symbol", "SyntaxError",
-  "TypeError", "URIError", "Uint16Array", "Uint32Array", "Uint8Array",
-  "Uint8ClampedArray", "WeakMap", "WeakRef", "WeakSet",
-]);
+const { builtInObjects, getProxyDetails, format: formatPercentSObject } = require("internal/util/percent_s");
 
 // https://tc39.es/ecma262/#sec-IsHTMLDDA-internal-slot
 const isUndetectableObject = v => typeof v === "undefined" && v !== undefined;
@@ -1051,7 +1035,7 @@ function getConstructorName(obj, ctx, recurseTimes, protoProps) {
     if (typeof descriptorValue === "function") {
       const descriptorValueName = descriptorValue.name;
       if (descriptorValueName !== "" && isInstanceof(tmp, descriptorValue)) {
-        if (protoProps !== undefined && (firstProto !== obj || !builtInObjects.has(descriptorValueName))) {
+        if (protoProps !== undefined && (firstProto !== obj || !builtInObjects.$has(descriptorValueName))) {
           addPrototypeProperties(ctx, tmp, firstProto || tmp, recurseTimes, protoProps);
         }
         return String(descriptorValueName);
@@ -1106,7 +1090,7 @@ function addPrototypeProperties(ctx, main, obj, recurseTimes, output) {
       if (
         descriptor !== undefined &&
         typeof descriptor.value === "function" &&
-        builtInObjects.has(descriptor.value.name)
+        builtInObjects.$has(descriptor.value.name)
       ) {
         return;
       }
@@ -2512,54 +2496,6 @@ function reduceToSingleString(ctx, output, base, braces, extrasType, recurseTime
   return `${braces[0]}${ln}${ArrayPrototypeJoin(output, `,\n${indentation}  `)} ${braces[1]}`;
 }
 
-function returnFalse() {
-  return false;
-}
-
-function hasBuiltInToString(value) {
-  // Prevent triggering proxy traps.
-  const getFullProxy = false;
-  const proxyTarget = getProxyDetails(value, getFullProxy);
-  if (proxyTarget !== undefined) {
-    if (proxyTarget === null) {
-      return true;
-    }
-    return hasBuiltInToString(proxyTarget);
-  }
-
-  let hasOwnToString = ObjectPrototypeHasOwnProperty;
-  let hasOwnToPrimitive = ObjectPrototypeHasOwnProperty;
-
-  // Count objects without `toString` and `Symbol.toPrimitive` function as built-in.
-  if (typeof value.toString !== "function") {
-    if (typeof value[SymbolToPrimitive] !== "function") {
-      return true;
-    } else if (ObjectPrototypeHasOwnProperty(value, SymbolToPrimitive)) {
-      return false;
-    }
-    hasOwnToString = returnFalse;
-  } else if (ObjectPrototypeHasOwnProperty(value, "toString")) {
-    return false;
-  } else if (typeof value[SymbolToPrimitive] !== "function") {
-    hasOwnToPrimitive = returnFalse;
-  } else if (ObjectPrototypeHasOwnProperty(value, SymbolToPrimitive)) {
-    return false;
-  }
-
-  // Find the object that has the `toString` property or `Symbol.toPrimitive` property
-  // as own property in the prototype chain.
-  let pointer = value;
-  do {
-    pointer = ObjectGetPrototypeOf(pointer);
-  } while (!hasOwnToString(pointer, "toString") && !hasOwnToPrimitive(pointer, SymbolToPrimitive));
-
-  // Check closer if the object is a built-in.
-  const descriptor = ObjectGetOwnPropertyDescriptor(pointer, "constructor");
-  return (
-    descriptor !== undefined && typeof descriptor.value === "function" && builtInObjects.has(descriptor.value.name)
-  );
-}
-
 const firstErrorLine = error => StringPrototypeSplit(error.message, "\n", 1)[0];
 let CIRCULAR_ERROR_MESSAGE;
 function tryStringify(arg) {
@@ -2626,15 +2562,10 @@ function formatWithOptionsInternal(inspectOptions, args) {
                 tempStr = formatNumberNoColor(tempArg, inspectOptions);
               } else if (typeof tempArg === "bigint") {
                 tempStr = formatBigIntNoColor(tempArg, inspectOptions);
-              } else if (typeof tempArg !== "object" || tempArg === null || !hasBuiltInToString(tempArg)) {
+              } else if (typeof tempArg !== "object" || tempArg === null) {
                 tempStr = String(tempArg);
               } else {
-                tempStr = inspect(tempArg, {
-                  ...inspectOptions,
-                  compact: 3,
-                  colors: false,
-                  depth: 0,
-                });
+                tempStr = formatPercentSObject(tempArg, inspectOptions, inspect);
               }
               break;
             }
@@ -2773,15 +2704,6 @@ function getPromiseDetails(promise) {
     return [state === 2 ? kRejected : kFulfilled, $peekPromiseSettledValue(promise)];
   }
   return [kPending, undefined];
-}
-function getProxyDetails(proxy, withHandler = true) {
-  const isProxy = $isProxyObject(proxy);
-  if (!isProxy) return undefined;
-  const handler = $getProxyInternalField(proxy, $proxyFieldHandler);
-  // if handler is null, the proxy is revoked
-  const target = handler === null ? null : $getProxyInternalField(proxy, $proxyFieldTarget);
-  if (withHandler) return [target, handler];
-  else return target;
 }
 function previewEntries(val, isIterator = false) {
   if (isIterator) {

@@ -6,6 +6,7 @@
 #include "JavaScriptCore/JSCJSValue.h"
 #include "JavaScriptCore/JSGlobalObject.h"
 #include "ZigGlobalObject.h"
+#include "InternalModuleRegistry.h"
 #include "JavaScriptCore/ObjectConstructor.h"
 #include "JavaScriptCore/PropertyNameArray.h"
 #include "JavaScriptCore/JSArray.h"
@@ -66,6 +67,23 @@ extern "C" JSC::EncodedJSValue JSC__JSValue__callCustomInspectFunction(
     auto inspectRet = JSC::profiledCall(globalObject, ProfilingReason::API, functionToCall, callData, thisValue, arguments);
     RETURN_IF_EXCEPTION(scope, {});
     RELEASE_AND_RETURN(scope, JSValue::encode(inspectRet));
+}
+
+// `%s` of an object on the native console: `format` of internal/util/percent_s, the rule util.format runs.
+extern "C" JSC::EncodedJSValue Bun__formatPercentSObject(Zig::GlobalObject* globalObject, JSC::EncodedJSValue encodedValue)
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSValue percentS = globalObject->internalModuleRegistry()->requireId(globalObject, vm, InternalModuleRegistry::Field::InternalUtilPercentS);
+    RETURN_IF_EXCEPTION(scope, {});
+    JSValue format = percentS.getObject()->getDirect(vm, WebCore::clientData(vm)->builtinNames().formatPublicName());
+
+    MarkedArgumentBuffer arguments;
+    arguments.append(JSValue::decode(encodedValue));
+    JSValue formatted = JSC::profiledCall(globalObject, ProfilingReason::API, format, JSC::getCallData(format), jsUndefined(), arguments);
+    RETURN_IF_EXCEPTION(scope, {});
+    RELEASE_AND_RETURN(scope, JSValue::encode(formatted));
 }
 
 // Port of V8's `internalBinding('util').getOwnNonIndexProperties(object, filter)` used by

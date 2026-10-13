@@ -147,7 +147,7 @@ declare function $resolvePromiseWithFirstResolvingFunctionCallCheck<T>(promise: 
 declare function $rejectPromiseWithFirstResolvingFunctionCallCheck(promise: Promise<unknown>, value: unknown): void;
 
 declare function $loadEsmIntoCjs(...args: any[]): TODO;
-declare function $getProxyInternalField(): TODO;
+declare function $getProxyInternalField(proxy: object, field: number): any;
 // Helper types for the `$isObject` / `$isCallable` / `$isArray` guards. Each guard has two overloads: a
 // generic one that narrows the argument's own type and rejects `any`, and a plain one for `any`. A single generic
 // predicate evaluates to `any` for an `any` argument, which TypeScript narrows to `never` in the false branch.

@@ -270,7 +270,13 @@ public:
     JSC::Structure* callSiteStructure() const { return m_callSiteStructure.getInitializedOnMainThread(this); }
 
     JSC::Structure* utilInspectOptionsStructure() const { return m_utilInspectOptionsStructure.getInitializedOnMainThread(this); }
-    JSC::JSFunction* utilInspectFunction() const { return m_utilInspectFunction.getInitializedOnMainThread(this); }
+    // `inspect` of internal/util/inspect. nullptr with an exception pending when the module cannot load.
+    JSC::JSFunction* utilInspectFunction()
+    {
+        if (auto* inspect = m_utilInspectFunction.get()) [[likely]]
+            return inspect;
+        return loadUtilInspectFunction();
+    }
     JSC::JSFunction* utilInspectStylizeColorFunction() const { return m_utilInspectStylizeColorFunction.getInitializedOnMainThread(this); }
     JSC::JSFunction* utilInspectStylizeNoColorFunction() const { return m_utilInspectStylizeNoColorFunction.getInitializedOnMainThread(this); }
 
@@ -623,7 +629,7 @@ public:
     V(private, LazyPropertyOfGlobalObject<Structure>, m_pendingVirtualModuleResultStructure)                 \
     V(private, LazyPropertyOfGlobalObject<Structure>, m_JSSocketHandlersStructure)                           \
     V(private, LazyPropertyOfGlobalObject<JSFunction>, m_nativeMicrotaskTrampoline)                          \
-    V(private, LazyPropertyOfGlobalObject<JSFunction>, m_utilInspectFunction)                                \
+    V(private, WriteBarrier<JSFunction>, m_utilInspectFunction)                                              \
     V(private, LazyPropertyOfGlobalObject<Structure>, m_utilInspectOptionsStructure)                         \
     V(private, LazyPropertyOfGlobalObject<JSFunction>, m_utilInspectStylizeColorFunction)                    \
     V(private, LazyPropertyOfGlobalObject<JSFunction>, m_utilInspectStylizeNoColorFunction)                  \
@@ -788,6 +794,7 @@ public:
 
 private:
     void addBuiltinGlobals(JSC::VM&);
+    JSC::JSFunction* loadUtilInspectFunction();
 
     friend class WebCore::JSBuiltinInternalFunctions;
     JSC::WriteBarrier<JSC::Structure> m_domStructures[static_cast<size_t>(WebCore::DOMStructureSlot::Count)];

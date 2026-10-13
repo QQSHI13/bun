@@ -2130,6 +2130,18 @@ void initLazyClassStructures(GlobalObject* globalObject)
 
 } // namespace
 
+// Not a LazyProperty: its initializer must call init.set(), and loading a module can throw.
+JSC::JSFunction* GlobalObject::loadUtilInspectFunction()
+{
+    auto& vm = this->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    JSValue inspectModule = internalModuleRegistry()->requireId(this, vm, Bun::InternalModuleRegistry::Field::InternalUtilInspect);
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    auto* inspect = uncheckedDowncast<JSFunction>(inspectModule.getObject()->getDirect(vm, Identifier::fromString(vm, "inspect"_s)));
+    m_utilInspectFunction.set(vm, this, inspect);
+    return inspect;
+}
+
 void GlobalObject::finishCreation(VM& vm)
 {
     Base::finishCreation(vm);
@@ -2666,16 +2678,6 @@ void GlobalObject::finishCreation(VM& vm)
              init.set(JSFunction::create(init.vm, init.owner, 2, "ErrorPrepareStackTrace"_s, jsFunctionDefaultErrorPrepareStackTrace, ImplementationVisibility::Public));
          } },
 
-        { OBJECT_OFFSETOF(GlobalObject, m_utilInspectFunction), [](const LazyProperty<JSGlobalObject, JSFunction>::Initializer& init) {
-             auto scope = DECLARE_THROW_SCOPE(init.vm);
-             JSValue nodeUtilValue = uncheckedDowncast<Zig::GlobalObject>(init.owner)->internalModuleRegistry()->requireId(init.owner, init.vm, Bun::InternalModuleRegistry::Field::NodeUtil);
-             RETURN_IF_EXCEPTION(scope, );
-             RELEASE_ASSERT(nodeUtilValue.isObject());
-             auto prop = nodeUtilValue.getObject()->getIfPropertyExists(init.owner, Identifier::fromString(init.vm, "inspect"_s));
-             RETURN_IF_EXCEPTION(scope, );
-             ASSERT(prop);
-             init.set(uncheckedDowncast<JSFunction>(prop));
-         } },
         { OBJECT_OFFSETOF(GlobalObject, m_utilInspectStylizeColorFunction), [](const LazyProperty<JSGlobalObject, JSFunction>::Initializer& init) {
              auto scope = DECLARE_THROW_SCOPE(init.vm);
              JSC::MarkedArgumentBuffer args;

@@ -2419,12 +2419,22 @@ pub mod formatter {
                         const MIN_BEFORE_E_NOTATION: f64 = 0.000001;
                         match token {
                             PercentTag::S => {
-                                self.print_as::<ENABLE_ANSI_COLORS>(
-                                    Tag::String,
-                                    writer_,
-                                    next_value,
-                                    next_value.js_type(),
-                                )?;
+                                // Node's `%s` for these is `String(value)`.
+                                if next_value.is_string_literal()
+                                    || (next_value.is_number()
+                                        && next_value != JSValue::js_double_number(-0.0))
+                                    || next_value.is_boolean()
+                                    || next_value.is_undefined_or_null()
+                                {
+                                    self.print_as::<ENABLE_ANSI_COLORS>(
+                                        Tag::String,
+                                        writer_,
+                                        next_value,
+                                        next_value.js_type(),
+                                    )?;
+                                } else {
+                                    self.print_percent_s_slow(writer_, next_value)?;
+                                }
                                 writer = WrappedWriter {
                                     ctx: writer_,
                                     failed: false,
@@ -3203,6 +3213,10 @@ pub mod formatter {
             max_depth: u32,
             colors: bool,
         ) -> JSValue;
+
+        /// C++ helper (`UtilInspect.cpp`) — `%s` of an object: the string from
+        /// `format` of `internal/util/percent_s`, the rule `util.format` runs.
+        safe fn Bun__formatPercentSObject(global: &JSGlobalObject, value: JSValue) -> JSValue;
     }
 
     // ───────────────────────────────────────────────────────────────────────
@@ -3524,6 +3538,56 @@ pub mod formatter {
             self.write_with_formatting::<C>(writer_, slice, self.global_this)
         }
 
+        /// `%s` for a value that `String()` does not print the way Node's
+        /// `util.format` does: -0, a BigInt, a Symbol, or an object.
+        #[cold]
+        #[inline(never)]
+        fn print_percent_s_slow(
+            &mut self,
+            writer_: &mut dyn bun_io::Write,
+            value: JSValue,
+        ) -> JsResult<()> {
+            let js_type = value.js_type();
+            if value.is_number() {
+                return self.print_as::<false>(Tag::Double, writer_, value, js_type);
+            }
+            if value.is_big_int() {
+                return self.print_as::<false>(Tag::BigInt, writer_, value, js_type);
+            }
+            if value.is_symbol() {
+                return self.print_as::<false>(Tag::Symbol, writer_, value, js_type);
+            }
+            // `typeof value === "function"`: Node prints `String(value)`.
+            if !value.is_object() || value.is_callable() {
+                return self.print_as::<false>(Tag::String, writer_, value, js_type);
+            }
+
+            let mut remove_before_recurse = false;
+            if !self.print_as_prelude::<false>(writer_, value, false, &mut remove_before_recurse)? {
+                return Ok(());
+            }
+            let formatted = crate::from_js_host_call(self.global_this, || {
+                Bun__formatPercentSObject(self.global_this, value)
+            })?;
+            let utf8 = formatted.to_utf8(self.global_this)?;
+            let mut rest = utf8.slice();
+            self.add_for_new_line(rest.len());
+            let mut ok = true;
+            if self.indent > 0 {
+                // Every line of the value keeps the console.group indent.
+                while let Some(newline) = strings::index_of_char_usize(rest, b'\n') {
+                    ok = ok
+                        && writer_.write_all(&rest[..=newline]).is_ok()
+                        && self.write_indent(writer_).is_ok();
+                    rest = &rest[newline + 1..];
+                }
+            }
+            if !(ok && writer_.write_all(rest).is_ok()) {
+                self.failed = true;
+            }
+            Ok(())
+        }
+
         #[inline(never)]
         fn print_string<const C: bool>(
             &mut self,
@@ -3531,7 +3595,7 @@ pub mod formatter {
             value: JSValue,
             js_type: jsc::JSType,
         ) -> JsResult<()> {
-            // This is called from the '%s' formatter, so it can actually be any value
+            // `%s` also sends a number, boolean, null, undefined or function here, for `String(value)`.
             use crate::StringJsc as _;
             let str = BunString::from_js(value, self.global_this)?;
             let mut writer = WrappedWriter {
