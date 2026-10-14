@@ -13,6 +13,10 @@
 #include <JavaScriptCore/VMTrapsInlines.h>
 #include <JavaScriptCore/CallData.h>
 #include <JavaScriptCore/JSPromise.h>
+#include <JavaScriptCore/JSMap.h>
+#include <JavaScriptCore/JSMapInlines.h>
+#include <JavaScriptCore/JSModuleLoader.h>
+#include <JavaScriptCore/ModuleRegistryEntry.h>
 #include <JavaScriptCore/IteratorOperations.h>
 #include "JavaScriptCore/Completion.h"
 #include "JavaScriptCore/JSNativeStdFunction.h"
@@ -800,7 +804,17 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionLoad, (JSGlobalObject * globalObject, JSC::Ca
     return JSC::JSValue::encode(JSC::jsUndefined());
 }
 
+// Who reports the load Module.runMain() is about to start: the values of `RunMainOwner` in hw_exports.rs.
+enum class RunMainOwner : uint8_t {
+    Caller = 0,
+    EntryAwaits = 1,
+    EntryLoads = 2,
+};
+extern "C" RunMainOwner Bun__VirtualMachine__runMainOwner(void* bunVM, const BunString* key);
 extern "C" void Bun__VirtualMachine__setOverrideModuleRunMainPromise(void* bunVM, JSPromise* promise);
+extern "C" uint32_t Bun__VirtualMachine__hotReloadCounter(void* bunVM);
+BUN_DECLARE_HOST_FUNCTION(Bun__onRunMainRejected);
+
 JSC_DEFINE_HOST_FUNCTION(jsFunctionRunMain, (JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 {
     auto& vm = JSC::getVM(globalObject);
@@ -812,9 +826,44 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionRunMain, (JSGlobalObject * globalObject, JSC:
     auto key = globalObject->moduleLoader()->resolve(globalObject, JSC::Identifier::fromString(vm, name), {}, nullptr, /* useImportMap */ true);
     RETURN_IF_EXCEPTION(scope, {});
 
+    auto* zigGlobalObject = defaultGlobalObject(globalObject);
+    void* bunVM = zigGlobalObject->bunVM();
+    BunString keyString = Bun::toString(key.string());
+    switch (Bun__VirtualMachine__runMainOwner(bunVM, &keyString)) {
+    case RunMainOwner::EntryAwaits: {
+        auto* promise = JSC::loadAndEvaluateModule(globalObject, key.string(), nullptr, nullptr);
+        RETURN_IF_EXCEPTION(scope, {});
+        Bun__VirtualMachine__setOverrideModuleRunMainPromise(bunVM, promise);
+        return JSC::JSValue::encode(JSC::jsUndefined());
+    }
+    case RunMainOwner::EntryLoads:
+        return JSC::JSValue::encode(JSC::jsUndefined());
+    case RunMainOwner::Caller:
+        break;
+    }
+
+    // Loaded or loading, and not failed: nothing starts, and whoever started that load reports it.
+    if (auto* entry = globalObject->moduleLoader()->registryEntry(key)) {
+        JSValue failure = entry->fetchError();
+        if (!failure) {
+            failure = entry->error(globalObject);
+            RETURN_IF_EXCEPTION(scope, {});
+        }
+        if (!failure)
+            return JSC::JSValue::encode(JSC::jsUndefined());
+    } else {
+        bool required = zigGlobalObject->requireMap()->has(globalObject, jsString(vm, key.string()));
+        RETURN_IF_EXCEPTION(scope, {});
+        if (required)
+            return JSC::JSValue::encode(JSC::jsUndefined());
+    }
+
     auto* promise = JSC::loadAndEvaluateModule(globalObject, key.string(), nullptr, nullptr);
     RETURN_IF_EXCEPTION(scope, {});
-    Bun__VirtualMachine__setOverrideModuleRunMainPromise(defaultGlobalObject(globalObject)->bunVM(), promise);
+    // JSC marks this promise as handled, and nobody else looks at it.
+    auto* onRejected = JSC::JSFunction::create(vm, globalObject, 2, String(), Bun__onRunMainRejected, ImplementationVisibility::Private);
+    auto* reaction = JSPromise::create(vm, globalObject->promiseStructure());
+    promise->performPromiseThenWithContext(vm, globalObject, jsUndefined(), onRejected, reaction, jsNumber(Bun__VirtualMachine__hotReloadCounter(bunVM)));
 
     return JSC::JSValue::encode(JSC::jsUndefined());
 }
