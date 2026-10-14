@@ -1756,6 +1756,53 @@ const requestHeaders = (path: string, extra: Record<string, string> = {}) => ({
   ...extra,
 });
 
+/** One QUIC session; each `request` is one stream on it and resolves to
+ * `"<status> <body>"`, with an `"info <status>"` entry pushed to `seen` for
+ * every 1xx. A session that closes fails the pending request with its reason. */
+async function h3Session(port: number) {
+  const endpoint = new QuicEndpoint();
+  const client = await connect(`127.0.0.1:${port}`, {
+    endpoint,
+    servername: "localhost",
+    verifyPeer: "manual",
+    transportParams: { maxIdleTimeout: 5 },
+    onerror() {},
+  } as SessionOptions);
+  const closed = client.closed.then(
+    () => "session closed",
+    (err: Error & { code?: string; errorCode?: bigint }) => `session closed ${err?.code} ${err?.errorCode}`,
+  );
+  await client.opened;
+  return {
+    async request(headers: Record<string, string>, seen: string[] = []): Promise<string> {
+      const exchange = (async () => {
+        let status = "";
+        const stream = await client.createBidirectionalStream({
+          headers,
+          oninfo(received) {
+            seen.push("info " + received[":status"]);
+          },
+          onheaders(received) {
+            status = received[":status"] as string;
+          },
+        });
+        stream.closed.catch(() => {});
+        let body = "";
+        for await (const batch of stream as AsyncIterable<Uint8Array[]>) {
+          for (const chunk of batch) body += Buffer.from(chunk).toString("latin1");
+        }
+        return `${status} ${body}`;
+      })();
+      exchange.catch(() => {});
+      return await Promise.race([exchange, closed]);
+    },
+    async [Symbol.asyncDispose]() {
+      if (!client.destroyed) client.close().catch(() => {});
+      await endpoint[Symbol.asyncDispose]();
+    },
+  };
+}
+
 describe("Bun.serve HTTP/3 request validation", () => {
   test("rejects a request whose field value contains CR or LF before the fetch handler runs", async () => {
     let reachedWithProbe = 0;
@@ -1866,6 +1913,139 @@ describe("Bun.serve HTTP/3 request validation", () => {
       "example.com\\other:8080": "200 /index",
       "[::1]:3000?q": "200 /index",
       "example.com:8443": "200 https://example.com:8443/index",
+    });
+  });
+
+  // The request line of HTTP/3 is four pseudo-header values that QPACK delivers
+  // as sent. The listener answers them before the router, with the rules the
+  // HTTP/2 listener has: no handler and no route may see a method or a path
+  // that was not on the wire.
+  describe("refuses a request line before the router", () => {
+    function serve(dir: string) {
+      const inFlight = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const server = Bun.serve({
+        port: 0,
+        tls,
+        http3: true,
+        routes: {
+          "/guarded": { GET: () => new Response("the GET arm"), POST: () => new Response("the POST arm") },
+          "/static": new Response("static"),
+          "/file": Bun.file(join(dir, "file.txt")),
+        },
+        async fetch(req) {
+          if (req.url.endsWith("/slow")) {
+            inFlight.resolve();
+            await release.promise;
+          }
+          return new Response(`${req.method} ${req.url}`);
+        },
+      });
+      return { server, inFlight, release };
+    }
+
+    test("501 for a method that is not one of Bun's, in any case, on every kind of route", async () => {
+      using dir = tempDir("serve-h3-request-line", { "file.txt": "file" });
+      const { server, inFlight, release } = serve(String(dir));
+      await using _ = server;
+      await using session = await h3Session(server.port!);
+
+      // A request that is still in flight on the session when the refusals are sent.
+      const slow = session.request(requestHeaders("/slow"));
+      await inFlight.promise;
+
+      const methods = ["BREW", "DELETE2", Buffer.alloc(300, "M").toString(), "get", "Post", "head", "M_SEARCH"];
+      const results: Record<string, string> = {};
+      for (const path of ["/echo", "/guarded", "/static", "/file"]) {
+        for (const method of methods) {
+          results[`${method.slice(0, 8)} ${path}`] = await session.request(requestHeaders(path, { ":method": method }));
+        }
+      }
+      const expected = Object.fromEntries(Object.keys(results).map(row => [row, "501 "]));
+
+      // No 100 Continue ahead of a refusal.
+      const seen: string[] = [];
+      seen.push(await session.request(requestHeaders("/echo", { ":method": "BREW", expect: "100-continue" }), seen));
+
+      release.resolve();
+      expect({ results, seen, slow: await slow, after: await session.request(requestHeaders("/guarded")) }).toEqual({
+        results: expected,
+        seen: ["501 "],
+        slow: "200 GET https://localhost/slow",
+        after: "200 the GET arm",
+      });
+    });
+
+    test("400 for a request line that is malformed", async () => {
+      using dir = tempDir("serve-h3-request-line", { "file.txt": "file" });
+      const { server } = serve(String(dir));
+      await using _ = server;
+      await using session = await h3Session(server.port!);
+
+      const { ":method": _method, ...noMethod } = requestHeaders("/echo");
+      const { ":authority": _authority, ...noAuthority } = requestHeaders("/echo");
+      const rows: Record<string, Record<string, string>> = {
+        "no :method": noMethod,
+        ":method with SP": requestHeaders("/echo", { ":method": "GET /x" }),
+        ":method with a control byte": requestHeaders("/echo", { ":method": "GE\x01T" }),
+        ":path with SP": requestHeaders("/a b"),
+        ":path with HTAB": requestHeaders("/sta\ttic"),
+        ":path with a control byte": requestHeaders("/echo\x01"),
+        ":path without a leading slash": requestHeaders("static"),
+        ":path * with GET": requestHeaders("*"),
+        "empty :path": requestHeaders(""),
+        "absolute-form :path": requestHeaders("https://other.invalid/static"),
+        "CONNECT with :path": requestHeaders("/static", { ":method": "CONNECT" }),
+        "no :authority and no host": noAuthority,
+      };
+      const results: Record<string, string> = {};
+      for (const [row, headers] of Object.entries(rows)) results[row] = await session.request(headers);
+
+      expect({ results, after: await session.request(requestHeaders("/static")) }).toEqual({
+        results: Object.fromEntries(Object.keys(rows).map(row => [row, "400 "])),
+        after: "200 static",
+      });
+    });
+
+    test("serves every method Bun has and the request lines HTTP/1.1 and HTTP/2 serve", async () => {
+      using dir = tempDir("serve-h3-request-line", { "file.txt": "file" });
+      const { server } = serve(String(dir));
+      await using _ = server;
+      await using session = await h3Session(server.port!);
+
+      const methods =
+        "ACL BIND CHECKOUT COPY DELETE GET LINK LOCK M-SEARCH MERGE MKACTIVITY MKADDRESSBOOK MKCALENDAR MKCOL MOVE NOTIFY OPTIONS PATCH POST PROPFIND PROPPATCH PURGE PUT QUERY REBIND REPORT SEARCH SOURCE SUBSCRIBE TRACE UNBIND UNLINK UNLOCK UNSUBSCRIBE".split(
+          " ",
+        );
+      const results: Record<string, string> = {};
+      for (const method of methods) {
+        results[method] = await session.request(requestHeaders("/echo", { ":method": method }));
+      }
+      const expected: Record<string, string> = Object.fromEntries(
+        methods.map(method => [method, `200 ${method} https://localhost/echo`]),
+      );
+
+      const { ":authority": _authority, ...noAuthority } = requestHeaders("/echo");
+      const { ":path": _path, ...noPath } = requestHeaders("", { ":method": "CONNECT", ":authority": "localhost:443" });
+      const others: Record<string, [Record<string, string>, string]> = {
+        HEAD: [requestHeaders("/echo", { ":method": "HEAD" }), "200 "],
+        // Well-formed, and no route takes a request without a path.
+        "CONNECT without :path": [noPath, "404 "],
+        "OPTIONS *": [requestHeaders("*", { ":method": "OPTIONS" }), "200 OPTIONS *"],
+        "host without :authority": [{ ...noAuthority, host: "localhost" }, "200 GET https://localhost/echo"],
+        // The one byte 0xE9 is not UTF-8, so the URL parser writes U+FFFD, as it does over HTTP/1.1 and HTTP/2.
+        "DEL and a byte above 0x7f in :path": [
+          requestHeaders("/echo\x7f\xe9"),
+          "200 GET https://localhost/echo%7F%EF%BF%BD",
+        ],
+        "query and percent-encoding": [requestHeaders("/echo%20a?b=c"), "200 GET https://localhost/echo%20a?b=c"],
+      };
+      for (const [row, [headers, response]] of Object.entries(others)) {
+        results[row] = await session.request(headers);
+        expected[row] = response;
+      }
+
+      expect(results).toEqual(expected);
     });
   });
 
