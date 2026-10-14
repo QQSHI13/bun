@@ -1624,6 +1624,99 @@ describe("Bun.serve HTTP/3 lifecycle", () => {
   });
 });
 
+// HTTP/1.1 gives `req.body === null` to a request with no Content-Length and no
+// Transfer-Encoding, and HTTP/2 to one whose HEADERS frame carries END_STREAM.
+// The HTTP/3 twin is a stream whose FIN came with the header block.
+describe("Bun.serve HTTP/3 req.body", () => {
+  function serve() {
+    const hooks: { dispatched?: () => void } = {};
+    const server = Bun.serve({
+      port: 0,
+      tls,
+      http3: true,
+      async fetch(req) {
+        const atDispatch = req.body === null ? "null" : "stream";
+        hooks.dispatched?.();
+        return new Response(`${atDispatch} ${JSON.stringify(await req.text())}`);
+      },
+    });
+    return { server, hooks };
+  }
+
+  /** One request whose stream the client ends only after the handler ran. */
+  async function endAfterDispatch(
+    server: Bun.Server<undefined>,
+    hooks: { dispatched?: () => void },
+    extra: Record<string, string>,
+  ) {
+    const dispatched = Promise.withResolvers<void>();
+    hooks.dispatched = dispatched.resolve;
+    await using endpoint = new QuicEndpoint();
+    const client = await connect(`127.0.0.1:${server.port}`, {
+      endpoint,
+      servername: "localhost",
+      verifyPeer: "manual",
+      transportParams: { maxIdleTimeout: 5 },
+      onerror: dispatched.reject,
+    } as SessionOptions);
+    client.closed.then(
+      () => dispatched.reject(new Error("the session closed before the handler ran")),
+      dispatched.reject,
+    );
+    await client.opened;
+    const stream = await client.createBidirectionalStream();
+    stream.closed.catch(() => {});
+    const writer = stream.writer;
+    stream.sendHeaders(requestHeaders("/", { ":method": "POST", ...extra }));
+    await dispatched.promise;
+    writer.endSync();
+    let body = "";
+    for await (const batch of stream as AsyncIterable<Uint8Array[]>) {
+      for (const chunk of batch) body += Buffer.from(chunk).toString("latin1");
+    }
+    if (!client.destroyed) client.close().catch(() => {});
+    return body;
+  }
+
+  test("is null for a request that fetch() sends without a body", async () => {
+    const { server } = serve();
+    await using _ = server;
+    const results: Record<string, string> = {};
+    for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "PROPFIND"]) {
+      results[method] = await (await fetchH3(server.port!, "/", { method })).text();
+    }
+    results["POST with an empty body"] = await (await fetchH3(server.port!, "/", { method: "POST", body: "" })).text();
+    expect(results).toEqual({
+      GET: 'null ""',
+      POST: 'null ""',
+      PUT: 'null ""',
+      PATCH: 'null ""',
+      DELETE: 'null ""',
+      OPTIONS: 'null ""',
+      PROPFIND: 'null ""',
+      "POST with an empty body": 'null ""',
+    });
+  });
+
+  test("is null for content-length: 0 on a stream that is still open", async () => {
+    const { server, hooks } = serve();
+    await using _ = server;
+    expect(await endAfterDispatch(server, hooks, { "content-length": "0" })).toBe('null ""');
+  });
+
+  test("is a stream when the request can still carry bytes", async () => {
+    const { server, hooks } = serve();
+    await using _ = server;
+    expect({
+      "ends empty after the handler ran": await endAfterDispatch(server, hooks, {}),
+      "has a body": await (await fetchH3(server.port!, "/", { method: "POST", body: "abc" })).text(),
+    }).toEqual({
+      "ends empty after the handler ran": 'stream ""',
+      "has a body": 'stream "abc"',
+    });
+  });
+});
+
 describe("Bun.serve HTTP/3 production", () => {
   // RFC 9110 §6.6.1: an origin server with a clock MUST send Date.
   // H1 writes it via HttpResponse::writeMark(); H3 must too.
