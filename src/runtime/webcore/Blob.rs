@@ -1438,23 +1438,11 @@ impl BlobExt for Blob {
                 } else {
                     let mut file_path = bun_paths::path_buffer_pool::get();
                     let path = pathlike.path().slice_z(&mut file_path);
-                    let flags = bun_sys::O::WRONLY
-                        | bun_sys::O::CREAT
-                        | bun_sys::O::TRUNC
-                        | bun_sys::O::NONBLOCK;
-                    let mode = options.mode.unwrap_or(WRITE_PERMISSIONS);
-                    let mut result = bun_sys::open(path, flags, mode);
-                    if let bun_sys::Result::Err(err) = &result {
-                        if err.get_errno() == bun_sys::E::ENOENT
-                            && options.mkdirp_if_not_exists.unwrap_or(true)
-                        {
-                            result = match mkdirp_parent(path.as_bytes()) {
-                                Ok(()) => bun_sys::open(path, flags, mode),
-                                Err(err) => Err(err),
-                            };
-                        }
-                    }
-                    match result {
+                    match open_path_for_write(
+                        path,
+                        options.mkdirp_if_not_exists.unwrap_or(true),
+                        options.mode.unwrap_or(WRITE_PERMISSIONS),
+                    ) {
                         bun_sys::Result::Ok(result) => result,
                         bun_sys::Result::Err(err) => {
                             return Ok(JSPromise::rejected_promise(
@@ -4049,6 +4037,23 @@ pub(crate) fn mkdirp_parent(path: &[u8]) -> bun_sys::Result<()> {
         .map(|_| ())
 }
 
+/// Open `path` for a write that replaces its content. With `mkdirp`, a missing
+/// parent directory is created and the open runs once more.
+pub(crate) fn open_path_for_write(
+    path: &bun_core::ZStr,
+    mkdirp: bool,
+    mode: bun_sys::Mode,
+) -> bun_sys::Result<Fd> {
+    let flags = bun_sys::O::WRONLY | bun_sys::O::CREAT | bun_sys::O::TRUNC | bun_sys::O::NONBLOCK;
+    match bun_sys::open(path, flags, mode) {
+        Err(err) if mkdirp && err.get_errno() == bun_sys::E::ENOENT => {
+            mkdirp_parent(path.as_bytes())?;
+            bun_sys::open(path, flags, mode)
+        }
+        result => result,
+    }
+}
+
 // TODO: move this to bun_sys?
 #[inline(never)]
 #[cfg(not(windows))]
@@ -4073,21 +4078,6 @@ pub(crate) fn mkdir_if_not_exists<T: MkdirpTarget>(
         }
     }
     Retry::No
-}
-
-/// `bun_sys::Error` only
-/// exposes `with_path(&[u8])`, so route through the
-/// `PathOrFileDescriptor`'s slice when it's a path and leave the error
-/// unchanged for fds.
-#[inline]
-fn sys_error_with_path_like(
-    err: &bun_sys::Error,
-    pathlike: &PathOrFileDescriptor,
-) -> bun_sys::Error {
-    match pathlike {
-        PathOrFileDescriptor::Path(p) => err.with_path(p.slice()),
-        PathOrFileDescriptor::Fd(_) => err.clone(),
-    }
 }
 
 /// Receiver trait for `mkdir_if_not_exists`; impls optionally
@@ -4121,9 +4111,7 @@ pub(crate) struct WriteFileOptions {
     pub(crate) mode: Option<bun_sys::Mode>,
 }
 
-/// Write an empty string to a file by truncating it.
-///
-/// This behavior matches what we do with the fast path.
+/// Write a source that has no bytes: a path is opened like any other write, an fd is left alone.
 fn write_file_with_empty_source_to_destination(
     cx: &bun_jsc::JsThread<'_>,
     destination_blob: &mut Blob,
@@ -4153,86 +4141,23 @@ fn write_file_with_empty_source_to_destination(
                     JSValue::js_number(0.0),
                 ));
             }
-            // TODO: make this async
-            // `VirtualMachine::node_fs()` currently returns `*mut c_void`; the
-            // typed `&mut NodeFS` accessor isn't wired yet, so use a fresh
-            // `NodeFS` (it carries no per-call state for
-            // `truncate`/`mkdir_recursive`).
-            let mut node_fs = node::fs::NodeFS::default();
-            let mut result = node_fs.truncate(
-                &node::fs::args::Truncate {
-                    path: file.pathlike.clone(),
-                    len: 0,
-                    flags: bun_sys::O::CREAT,
-                },
-                node::fs::Flavor::Sync,
-            );
-
-            if let bun_sys::Result::Err(ref mut err) = result {
-                let errno = err.get_errno();
-                'err: {
-                    let mut current = errno;
-                    loop {
-                        match current {
-                            // truncate might return EPERM when the parent directory doesn't exist
-                            // #6336
-                            bun_sys::E::EPERM => {
-                                err.errno = bun_sys::E::ENOENT as _;
-                                current = bun_sys::E::ENOENT;
-                                continue;
-                            }
-                            bun_sys::E::ENOENT => {
-                                if options.mkdirp_if_not_exists == Some(false) {
-                                    break 'err;
-                                }
-                                let dirpath: &[u8] =
-                                    match bun_core::dirname(file.pathlike.path().slice()) {
-                                        Some(d) => d,
-                                        None => break 'err,
-                                    };
-                                let mkdir_result =
-                                    node_fs.mkdir_recursive(&node::fs::args::Mkdir {
-                                        path: PathLike::borrowed(dirpath),
-                                        recursive: true,
-                                        always_return_none: true,
-                                        ..Default::default()
-                                    });
-                                if let bun_sys::Result::Err(e) = mkdir_result {
-                                    *err = e;
-                                    break 'err;
-                                }
-
-                                // SAFETY: we check if `file.pathlike` is an fd above, returning if it is.
-                                let mut buf = bun_paths::path_buffer_pool::get();
-                                let mode: bun_sys::Mode =
-                                    options.mode.unwrap_or(node::fs::DEFAULT_PERMISSION);
-                                match bun_sys::File::open(
-                                    file.pathlike.path().slice_z(&mut buf),
-                                    bun_sys::O::CREAT | bun_sys::O::TRUNC,
-                                    mode,
-                                ) {
-                                    bun_sys::Result::Err(e) => {
-                                        *err = e;
-                                        break 'err;
-                                    }
-                                    bun_sys::Result::Ok(f) => {
-                                        let _ = f.close(); // close error is non-actionable
-                                        return Ok(JSPromise::resolved_promise_value(
-                                            cx.global(),
-                                            JSValue::js_number(0.0),
-                                        ));
-                                    }
-                                }
-                            }
-                            _ => break 'err,
-                        }
-                    }
+            let mut buf = bun_paths::path_buffer_pool::get();
+            let path = file.pathlike.path().slice_z(&mut buf);
+            match open_path_for_write(
+                path,
+                options.mkdirp_if_not_exists.unwrap_or(true),
+                options.mode.unwrap_or(node::fs::DEFAULT_PERMISSION),
+            ) {
+                bun_sys::Result::Ok(fd) => {
+                    let _ = bun_sys::close(fd);
                 }
-
-                *err = sys_error_with_path_like(err, &file.pathlike);
-                return Ok(
-                    JSPromise::rejected_promise(cx.global(), err.to_js(cx.global())).to_js(),
-                );
+                bun_sys::Result::Err(err) => {
+                    return Ok(JSPromise::rejected_promise(
+                        cx.global(),
+                        err.with_path(path).to_js(cx.global()),
+                    )
+                    .to_js());
+                }
             }
         }
         store::Data::S3(s3) => {
