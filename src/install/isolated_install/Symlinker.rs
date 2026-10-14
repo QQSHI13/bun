@@ -31,12 +31,27 @@ impl Symlinker {
         }
     }
 
-    // Ok(true) when a link was written.
-    pub(crate) fn ensure_symlink(&mut self, strategy: Strategy) -> bun_sys::Result<bool> {
+    /// The text of the link at `dest`, unless it is the link that `symlink` writes.
+    fn link_to_another_target(&mut self) -> Option<Box<[u8]>> {
+        let mut link_buf = bun_paths::path_buffer_pool::get();
+        let len = bun_sys::readlink(self.dest.slice_z(), &mut link_buf).ok()?;
+        // libuv adds a trailing slash to junctions.
+        let link = strings::without_trailing_slash(&link_buf[..len]);
+        if strings::eql_long(link, self.target.slice_z().as_bytes(), true) {
+            return None;
+        }
+        #[cfg(windows)]
+        if strings::eql_long(link, self.fallback_junction_target.slice(), true) {
+            return None;
+        }
+        Some(link.into())
+    }
+
+    pub(crate) fn ensure_symlink(&mut self, strategy: Strategy) -> bun_sys::Result<Linked> {
         match strategy {
             Strategy::ExpectMissing => {
                 return match self.symlink() {
-                    Ok(()) => Ok(true),
+                    Ok(()) => Ok(Linked::Created),
                     Err(symlink_err1) => match symlink_err1.get_errno() {
                         Errno::ENOENT => {
                             let Some(dest_parent) = self.dest.dirname() else {
@@ -44,11 +59,14 @@ impl Symlinker {
                             };
 
                             let _ = Fd::cwd().make_path(dest_parent);
-                            return self.symlink().map(|()| true);
+                            return self.symlink().map(|()| Linked::Created);
                         }
                         Errno::EEXIST => {
+                            let replaced = self.link_to_another_target();
                             let _ = Fd::cwd().delete_tree(self.dest.slice_z());
-                            return self.symlink().map(|()| true);
+                            return self
+                                .symlink()
+                                .map(|()| replaced.map_or(Linked::Created, Linked::Replaced));
                         }
                         _ => Err(symlink_err1),
                     },
@@ -62,7 +80,7 @@ impl Symlinker {
                         Err(readlink_err) => {
                             return match readlink_err.get_errno() {
                                 Errno::ENOENT => match self.symlink() {
-                                    Ok(()) => Ok(true),
+                                    Ok(()) => Ok(Linked::Created),
                                     Err(symlink_err) => match symlink_err.get_errno() {
                                         Errno::ENOENT => {
                                             let Some(dest_parent) = self.dest.dirname() else {
@@ -70,7 +88,7 @@ impl Symlinker {
                                             };
 
                                             let _ = Fd::cwd().make_path(dest_parent);
-                                            return self.symlink().map(|()| true);
+                                            return self.symlink().map(|()| Linked::Created);
                                         }
                                         _ => Err(symlink_err),
                                     },
@@ -100,10 +118,10 @@ impl Symlinker {
                                         false
                                     };
                                     if is_dir {
-                                        return Ok(false);
+                                        return Ok(Linked::Unchanged);
                                     }
                                     let _ = bun_sys::unlink(self.dest.slice_z());
-                                    return self.symlink().map(|()| true);
+                                    return self.symlink().map(|()| Linked::Created);
                                 }
                             };
                         }
@@ -114,16 +132,18 @@ impl Symlinker {
                 current_link = strings::without_trailing_slash(current_link);
 
                 if strings::eql_long(current_link, self.target.slice_z().as_bytes(), true) {
-                    return Ok(false);
+                    return Ok(Linked::Unchanged);
                 }
 
                 #[cfg(windows)]
-                {
-                    if strings::eql_long(current_link, self.fallback_junction_target.slice(), true)
-                    {
-                        return Ok(false);
-                    }
+                if strings::eql_long(current_link, self.fallback_junction_target.slice(), true) {
+                    return Ok(Linked::Unchanged);
+                }
 
+                let replaced = Box::<[u8]>::from(current_link);
+
+                #[cfg(windows)]
+                {
                     // this existing link is pointing to the wrong package.
                     // on windows rmdir must be used for symlinks created to point
                     // at directories, even if the target no longer exists
@@ -143,7 +163,7 @@ impl Symlinker {
                     let _ = bun_sys::unlink(self.dest.slice_z());
                 }
 
-                return self.symlink().map(|()| true);
+                return self.symlink().map(|()| Linked::Replaced(replaced));
             }
         }
     }
@@ -153,4 +173,14 @@ impl Symlinker {
 pub enum Strategy {
     ExpectExisting,
     ExpectMissing,
+}
+
+/// What `ensure_symlink` found at `dest`.
+pub(crate) enum Linked {
+    /// The link that it writes, or a directory that it keeps.
+    Unchanged,
+    /// Nothing, or something that is not a link.
+    Created,
+    /// A link to another target. This is its text.
+    Replaced(Box<[u8]>),
 }

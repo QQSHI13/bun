@@ -18,7 +18,8 @@ use bun_threading::{ThreadPool, WaitGroup};
 use crate::package_installer::NodeModulesFolder;
 use crate::{
     BuntagHashBuf, Lockfile, Npm, PackageID, PackageManager, Repository, Resolution,
-    TruncatedPackageNameHash, bun_fs, bun_json, buntaghashbuf_make, initialize_store, resolution,
+    TruncatedPackageNameHash, bin, bun_fs, bun_json, buntaghashbuf_make, initialize_store,
+    resolution,
 };
 
 bun_output::declare_scope!(install, hidden);
@@ -42,6 +43,24 @@ pub struct PackageInstall<'a> {
 
     pub(crate) node_modules: &'a NodeModulesFolder,
     pub lockfile: &'a Lockfile,
+
+    /// The bin of the package at the destination, set when `verify` parsed
+    /// its package.json and found another package than the one to install.
+    pub(crate) outgoing_bin: Option<bin::InstalledBin>,
+}
+
+/// What `install` does about a package that is already at the destination.
+#[derive(Clone, Copy)]
+pub enum Existing<'a> {
+    /// node_modules is new, so there is none.
+    Absent,
+    /// Move it out of the way and delete it.
+    Replace {
+        /// The bin of the package that takes its place.
+        bin: bin::Bin,
+        /// Set when the bins of the package can be in the global bin dir.
+        global_bin_path: Option<&'a ZStr>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -958,6 +977,23 @@ impl<'a> PackageInstall<'a> {
         if package_json_checker.parse().is_err() {
             return false;
         }
+
+        let verified = self.installed_name_and_version_match(&package_json_checker, resolution_tag);
+        if !verified {
+            // `uninstall_before_install` needs the bin of the package it moves
+            // away, and that package.json is parsed already.
+            self.outgoing_bin = package_json_checker
+                .root()
+                .map(bin::InstalledBin::from_json);
+        }
+        verified
+    }
+
+    fn installed_name_and_version_match(
+        &self,
+        package_json_checker: &bun_json::PackageJSONVersionChecker<'_>,
+        resolution_tag: resolution::Tag,
+    ) -> bool {
         if package_json_checker.has_errors() || !package_json_checker.has_found_name {
             return false;
         }
@@ -1930,7 +1966,16 @@ impl<'a> PackageInstall<'a> {
         Ok(InstallResult::Success)
     }
 
-    pub(crate) fn uninstall_before_install(&self, destination_dir: &Dir) {
+    /// `incoming` is the bin of the package that takes the place of the one
+    /// at the destination. `read_outgoing_manifest`: when `verify` did not
+    /// parse the package.json of the package at the destination, read it.
+    pub(crate) fn uninstall_before_install(
+        &mut self,
+        destination_dir: &Dir,
+        incoming: &bin::Bin,
+        global_bin_path: Option<&ZStr>,
+        read_outgoing_manifest: bool,
+    ) {
         let mut rand_path_buf = [0u8; 48];
         let rand_bytes = bun_core::fast_random().to_ne_bytes();
         let temp_path = {
@@ -1954,6 +1999,15 @@ impl<'a> PackageInstall<'a> {
                 // if it fails, that means the directory doesn't exist or was inaccessible
             }
             Ok(_) => {
+                // The task below deletes the package.json that names the bins.
+                let outgoing_bin = self.outgoing_bin.take();
+                if match &outgoing_bin {
+                    Some(outgoing_bin) => !outgoing_bin.is_none(),
+                    None => read_outgoing_manifest,
+                } {
+                    self.unlink_dropped_bins(outgoing_bin, temp_path, incoming, global_bin_path);
+                }
+
                 // Uninstall can sometimes take awhile in a large directory
                 // tree. Since we're renaming the directory to a randomly
                 // generated name, we can delete it in another thread without
@@ -2007,6 +2061,37 @@ impl<'a> PackageInstall<'a> {
         }
     }
 
+    /// The package that was at the destination is in `outgoing` now, next to it.
+    #[cold]
+    fn unlink_dropped_bins(
+        &self,
+        outgoing_bin: Option<bin::InstalledBin>,
+        outgoing: &ZStr,
+        incoming: &bin::Bin,
+        global_bin_path: Option<&ZStr>,
+    ) {
+        let mut dir_buf = bun_paths::path_buffer_pool::get();
+        let Some(dir) = path::resolve_path::join_abs_string_buf_checked::<path::platform::Auto>(
+            &self.node_modules.path,
+            &mut dir_buf[..],
+            &[outgoing.as_bytes()],
+        ) else {
+            return;
+        };
+        bin::Outgoing {
+            bin: outgoing_bin,
+            dir,
+            alias: self.destination_dir_subpath.as_bytes(),
+            node_modules_path: &self.node_modules.path,
+            global_bin_path: global_bin_path.map(ZStr::as_bytes),
+        }
+        .unlink_dropped_bins(
+            incoming,
+            &self.lockfile.buffers.string_bytes,
+            &self.lockfile.buffers.extern_strings,
+        );
+    }
+
     pub(crate) fn is_dangling_symlink(path: &ZStr) -> bool {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
@@ -2042,14 +2127,22 @@ impl<'a> PackageInstall<'a> {
 
     pub(crate) fn install_from_link(
         &mut self,
-        skip_delete: bool,
+        existing: Existing<'_>,
         destination_dir: &Dir,
     ) -> InstallResult {
         let dest_path = self.destination_dir_subpath;
         // If this fails, we don't care.
         // we'll catch it the next error
-        if !skip_delete && dest_path.as_bytes() != b"." {
-            self.uninstall_before_install(destination_dir);
+        if let Existing::Replace {
+            bin,
+            global_bin_path,
+        } = existing
+        {
+            if dest_path.as_bytes() != b"." {
+                // The destination gets a link. A link that is there already
+                // leads to the package.json of the package as it is now.
+                self.uninstall_before_install(destination_dir, &bin, global_bin_path, false);
+            }
         }
 
         // `None` when there is no directory component.
@@ -2304,18 +2397,12 @@ impl<'a> PackageInstall<'a> {
 
     pub(crate) fn install(
         &mut self,
-        skip_delete: bool,
+        existing: Existing<'_>,
         destination_dir: &Dir,
         method_: Method,
         resolution_tag: resolution::Tag,
     ) -> InstallResult {
         let _tracer = bun_core::perf::trace("PackageInstaller.install");
-
-        // If this fails, we don't care.
-        // we'll catch it the next error
-        if !skip_delete && self.destination_dir_subpath.as_bytes() != b"." {
-            self.uninstall_before_install(destination_dir);
-        }
 
         let mut supported_method_to_use = method_;
 
@@ -2325,6 +2412,25 @@ impl<'a> PackageInstall<'a> {
                 .is_workspace_tree_id(self.node_modules.tree_id)
         {
             supported_method_to_use = Method::Symlink;
+        }
+
+        // If this fails, we don't care.
+        // we'll catch it the next error
+        if let Existing::Replace {
+            bin,
+            global_bin_path,
+        } = existing
+        {
+            if self.destination_dir_subpath.as_bytes() != b"." {
+                // As in `install_from_link`.
+                let installs_link = supported_method_to_use == Method::Symlink;
+                self.uninstall_before_install(
+                    destination_dir,
+                    &bin,
+                    global_bin_path,
+                    !installs_link,
+                );
+            }
         }
 
         match supported_method_to_use {

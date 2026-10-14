@@ -1399,6 +1399,7 @@ impl<'a> PackageInstaller<'a> {
             // site stays safe.
             lockfile: self.lockfile(),
             cache_dir_subpath: ZStr::EMPTY,
+            outgoing_bin: None,
         };
         bun_output::scoped_log!(
             PackageInstaller,
@@ -1801,9 +1802,22 @@ impl<'a> PackageInstaller<'a> {
                 }
             };
 
+            let existing = if self.skip_delete {
+                package_install::Existing::Absent
+            } else {
+                let options = &self.manager().options;
+                package_install::Existing::Replace {
+                    bin: self.bins[package_id as usize],
+                    // A package of the root tree of a global install can have
+                    // links there from any earlier run.
+                    global_bin_path: (options.global && self.current_tree_id == 0)
+                        .then_some(options.bin_path),
+                }
+            };
+
             let install_result: package_install::InstallResult = match resolution.tag {
                 resolution::Tag::Symlink | resolution::Tag::Workspace => {
-                    installer.install_from_link(self.skip_delete, &destination_dir)
+                    installer.install_from_link(existing, &destination_dir)
                 }
                 _ => 'result: {
                     if resolution.tag == resolution::Tag::Root
@@ -1820,7 +1834,7 @@ impl<'a> PackageInstaller<'a> {
                             && self.lockfile().is_folder_tree_id(self.current_tree_id)
                         {
                             break 'result installer.install(
-                                self.skip_delete,
+                                existing,
                                 &destination_dir,
                                 installer.get_install_method(),
                                 resolution.tag,
@@ -1858,10 +1872,10 @@ impl<'a> PackageInstaller<'a> {
                         installer.cache_dir = owned_cache_dir.fd();
 
                         let result = if resolution.tag == resolution::Tag::Root {
-                            installer.install_from_link(self.skip_delete, &destination_dir)
+                            installer.install_from_link(existing, &destination_dir)
                         } else {
                             installer.install(
-                                self.skip_delete,
+                                existing,
                                 &destination_dir,
                                 installer.get_install_method(),
                                 resolution.tag,
@@ -1891,7 +1905,7 @@ impl<'a> PackageInstaller<'a> {
                         installer.get_install_method()
                     };
                     break 'result installer.install(
-                        self.skip_delete,
+                        existing,
                         &destination_dir,
                         method,
                         resolution.tag,

@@ -3398,7 +3398,7 @@ describe("binaries", () => {
         await bun(cwd, ["add", "tool-a@2.0.0"]);
         expect(await bins()).toHaveBins(v2);
 
-        expect(await bun(cwd, ["update", "--latest"])).toContain("tool-a@4.0.0");
+        expect(await bun(cwd, ["update", "--latest"])).toContain("tool-a 2.0.0 -> 4.0.0");
         expect(await bins()).toHaveBins([]);
       });
 

@@ -13,7 +13,7 @@ use bun_sys::{self as sys, Fd, FdExt};
 use bun_threading::IntrusiveWorkTask as _;
 use bun_threading::thread_pool::{Batch, Node as ThreadPoolNode, Task as ThreadPoolTask};
 
-use crate::package_install::PackageInstall;
+use crate::package_install::{Existing, PackageInstall};
 use crate::package_manager;
 use crate::{
     DependencyID, PackageID, PackageManager, bun_hash_tag, lockfile::Package,
@@ -489,10 +489,11 @@ impl PatchTask {
             // dummy value
             node_modules: &dummy_node_modules,
             lockfile,
+            outgoing_bin: None,
         };
 
         match pkg_install.install(
-            true,
+            Existing::Absent,
             sys::Dir::borrow(&system_tmpdir),
             InstallMethod::Copyfile,
             resolution_tag,

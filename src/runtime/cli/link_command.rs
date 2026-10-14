@@ -146,6 +146,36 @@ fn link(ctx: command::Context) -> crate::Result<()> {
 
         // Step 3a. symlink to the node_modules folder
         {
+            // Another package can have this name now, with other bins.
+            if let Some(registered_bin) =
+                bin::InstalledBin::read(Fd::from_std_dir(&node_modules), name)
+                && !registered_bin.is_none()
+                && let Ok(node_modules_path) =
+                    <AbsPath>::init_fd_path(Fd::from_std_dir(&node_modules))
+            {
+                let mut registered_dir_buf = bun_paths::path_buffer_pool::get();
+                if let Some(registered_dir) = bun_paths::resolve_path::join_abs_string_buf_checked::<
+                    bun_paths::platform::Auto,
+                >(
+                    node_modules_path.slice(),
+                    &mut registered_dir_buf[..],
+                    &[name],
+                ) {
+                    bin::Outgoing {
+                        bin: Some(registered_bin),
+                        dir: registered_dir,
+                        alias: name,
+                        node_modules_path: node_modules_path.slice(),
+                        global_bin_path: Some(manager.options.bin_path.as_bytes()),
+                    }
+                    .unlink_dropped_bins(
+                        &package.bin,
+                        lockfile.buffers.string_bytes.as_slice(),
+                        lockfile.buffers.extern_strings.as_slice(),
+                    );
+                }
+            }
+
             // delete it if it exists
             let _ = node_modules.delete_tree(name);
 

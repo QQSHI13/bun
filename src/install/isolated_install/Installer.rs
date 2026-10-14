@@ -2264,7 +2264,9 @@ impl<'a> Installer<'a> {
 
             dest.set_length(base_len);
             let _ = dest.append(dep_name); // OOM/capacity: fire-and-forget
-            if entry_node_modules_name.is_some_and(|name| strings::eql_long(dep_name, name, true)) {
+            let is_nested =
+                entry_node_modules_name.is_some_and(|name| strings::eql_long(dep_name, name, true));
+            if is_nested {
                 // same name as the entry itself: nest one node_modules deeper to avoid the collision
                 let _ = dest.append(b"node_modules"); // OOM/capacity: fire-and-forget
                 let _ = dest.append(dep_name); // OOM/capacity: fire-and-forget
@@ -2291,10 +2293,63 @@ impl<'a> Installer<'a> {
             };
             let result = symlinker.ensure_symlink(strategy);
             dest = symlinker.dest.into_sep::<{ PathSeparators::AUTO }>();
-            changed |= result?;
+            let linked = result?;
+            changed |= !matches!(linked, symlinker::Linked::Unchanged);
+            if let symlinker::Linked::Replaced(old_target) = linked {
+                // The bin dir of this entry links a nested dependency through the entry itself.
+                if !is_nested {
+                    self.unlink_dropped_dependency_bins(
+                        &dest.slice()[..base_len],
+                        dest.slice(),
+                        dep_name,
+                        dep.entry_id,
+                        &old_target,
+                    );
+                }
+            }
         }
 
         Ok(changed)
+    }
+
+    /// The link `dep_link` in `node_modules_path` led to `old_target` and
+    /// leads to the store entry `dep_entry_id` now.
+    #[cold]
+    fn unlink_dropped_dependency_bins(
+        &self,
+        node_modules_path: &[u8],
+        dep_link: &[u8],
+        dep_name: &[u8],
+        dep_entry_id: StoreEntryId,
+        old_target: &[u8],
+    ) {
+        // The text of a link is relative to the directory the link is in.
+        let mut outgoing_dir_buf = paths::path_buffer_pool::get();
+        let Some(outgoing_dir) =
+            paths::resolve_path::join_abs_string_buf_checked::<paths::platform::Auto>(
+                paths::resolve_path::dirname::<paths::platform::Auto>(dep_link),
+                &mut outgoing_dir_buf[..],
+                &[old_target],
+            )
+        else {
+            return;
+        };
+
+        let lockfile = self.lockfile();
+        let node_id = self.store.entries.items_node_id()[dep_entry_id.get() as usize];
+        let pkg_id = self.store.nodes.items_pkg_id()[node_id.get() as usize];
+        bin::Outgoing {
+            bin: None,
+            dir: outgoing_dir,
+            alias: dep_name,
+            node_modules_path,
+            global_bin_path: None,
+        }
+        .unlink_dropped_bins(
+            &lockfile.packages.items_bin()[pkg_id as usize],
+            lockfile.buffers.string_bytes.as_slice(),
+            lockfile.buffers.extern_strings.as_slice(),
+        );
     }
 
     pub(crate) fn link_dependency_bins(&self, parent_entry_id: StoreEntryId) -> crate::Result<()> {

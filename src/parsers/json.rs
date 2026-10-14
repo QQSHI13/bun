@@ -656,6 +656,8 @@ pub struct PackageJSONVersionChecker<'a> {
     found_version_len: usize,
     pub has_found_name: bool,
     pub has_found_version: bool,
+    /// The document that `parse` read.
+    parsed: Option<ParsedJson>,
 }
 
 impl<'a> PackageJSONVersionChecker<'a> {
@@ -669,7 +671,15 @@ impl<'a> PackageJSONVersionChecker<'a> {
             found_version_len: 0,
             has_found_name: false,
             has_found_version: false,
+            parsed: None,
         }
+    }
+
+    /// The root of the document, for a caller that needs another property
+    /// of a package.json it has checked. `None` before `parse` succeeds.
+    #[inline]
+    pub fn root(&self) -> Option<&Expr> {
+        self.parsed.as_ref().map(|parsed| &parsed.root)
     }
 
     /// Whether the checker's exclusively-borrowed `Log` recorded any errors.
@@ -690,7 +700,12 @@ impl<'a> PackageJSONVersionChecker<'a> {
 
     /// Parse the document and record its first top-level string-valued `name` and `version`.
     pub fn parse(&mut self) -> crate::Result<()> {
-        let parsed = parse_to_rows(self.source, self.log, PKG_JSON_CHECKER_OPTS, false)?;
+        let parsed = self.parsed.insert(parse_to_rows(
+            self.source,
+            self.log,
+            PKG_JSON_CHECKER_OPTS,
+            false,
+        )?);
         let js_ast::expr::Data::EObjectJSON(obj) = &parsed.root.data else {
             return Ok(());
         };
