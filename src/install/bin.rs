@@ -2070,12 +2070,9 @@ pub struct Outgoing<'a> {
 
 impl Outgoing<'_> {
     /// Unlinks the bins that this package declared and `incoming`, the bin of
-    /// the package that replaces it, does not. npm and pnpm take the old names
-    /// from the same place: the lockfile knows the new bin alone.
-    ///
-    /// An entry of `<node_modules_path>/.bin` or of the global bin dir goes
-    /// only when it links into `<node_modules_path>/<alias>`. A name that now
-    /// belongs to another package or to the user stays.
+    /// the package that replaces it, does not. An entry goes only when it
+    /// links into `<node_modules_path>/<alias>`: a name that another package
+    /// or the user took stays.
     #[cold]
     pub fn unlink_dropped_bins(
         self,
