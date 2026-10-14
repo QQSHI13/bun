@@ -2026,7 +2026,8 @@ impl InstalledBin {
     }
 
     /// Reads `package.json` in `package_dir`, which is relative to `dir`.
-    /// `None` when there is no such file or it does not parse.
+    /// `None` when there is no such file, it does not parse, or it cannot
+    /// declare a bin.
     pub fn read(dir: Fd, package_dir: &[u8]) -> Option<InstalledBin> {
         let mut path_buf = path::path_buffer_pool::get();
         let mut spill = Vec::new();
@@ -2036,6 +2037,10 @@ impl InstalledBin {
             &[package_dir, b"package.json"],
         );
         let contents = sys::File::read_from(dir, package_json_path.as_bytes()).ok()?;
+        // Most packages declare no bin. A file without the key needs no parse.
+        if !strings::contains(&contents, b"\"bin\"") {
+            return None;
+        }
         let source =
             bun_ast::Source::init_path_string(package_json_path.as_bytes(), contents.as_slice());
         let mut log = bun_ast::Log::init();
