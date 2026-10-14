@@ -282,6 +282,46 @@ it("reports an error and exits when the template's package.json entry body is tr
   expect(exitCode).toBe(1);
 });
 
+// `bun install` reads package.json with comments and trailing commas allowed, so a template may use them.
+// package-json-comments.test.ts has the same cases for a template from a local folder.
+for (const [dialect, manifest] of [
+  ["a trailing comma", `{\n  "name": "template",\n  "bun-create": { "start": "bun run go" },\n}\n`],
+  ["a comment", `{\n  // note\n  "name": "template",\n  "bun-create": { "start": "bun run go" }\n}\n`],
+]) {
+  it(`applies the package.json transforms to a GitHub template whose package.json has ${dialect}`, async () => {
+    const gz = await new Bun.Archive({ "template-main/package.json": manifest }, { compress: "gzip" }).bytes();
+
+    using server = Bun.serve({
+      tls,
+      port: 0,
+      fetch() {
+        return new Response(gz, { headers: { "content-type": "application/x-gzip" } });
+      },
+    });
+
+    await using proc = spawn({
+      cmd: [bunExe(), "create", "github.com/owner/template", "dest", "--no-install", "--no-git"],
+      cwd: x_dir,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...env,
+        NODE_TLS_REJECT_UNAUTHORIZED: "0",
+        GITHUB_API_DOMAIN: `${server.hostname}:${server.port}`,
+      },
+    });
+
+    const [out, err, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ out, err, exitCode, signalCode: proc.signalCode }).toEqual({
+      out: expect.stringContaining("\n  cd dest\n  bun run go\n"),
+      err: expect.not.stringContaining("error:"),
+      exitCode: 0,
+      signalCode: null,
+    });
+    expect(await Bun.file(join(x_dir, "dest", "package.json")).json()).toEqual({ name: "dest" });
+  });
+}
+
 // GitHandler::wait() used Futex::wait(.., Some(1000)) (1us timeout) in a loop,
 // issuing ~18k futex syscalls/sec while the git thread ran. POSIX-only: stub
 // `git` is a shell script and ru_nvcsw is always 0 on Windows.

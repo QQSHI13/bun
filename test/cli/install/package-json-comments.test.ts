@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { exists } from "fs/promises";
-import { bunEnv, bunExe, tempDir, tls } from "harness";
+import { bunEnv, bunExe, tempDir } from "harness";
 import { join } from "node:path";
 
 // `bun install` reads package.json with comments and trailing commas allowed. Every command below reads a
@@ -53,8 +53,7 @@ async function run(cwd: string, args: string[], env: Record<string, string> = {}
 }
 
 describe.each(dialects)("a package.json with %s", (_, write) => {
-  // Not concurrent: each case runs `bun install`, then `bun pm trust` and the script of the package.
-  describe("bun pm trust", () => {
+  describe.concurrent("bun pm trust", () => {
     const cache = (root: string) => ({ BUN_INSTALL_CACHE_DIR: join(root, ".cache") });
     const ran = (root: string) => exists(join(root, "node_modules", "q", "ran.txt"));
 
@@ -62,13 +61,20 @@ describe.each(dialects)("a package.json with %s", (_, write) => {
     async function installUntrusted(root: string) {
       const q = { name: "q", version: "1.0.0", scripts: { postinstall: "echo ran > ran.txt" } };
       await Bun.write(join(root, "q.tgz"), await tarball({ "package/package.json": JSON.stringify(q) }));
-      const { stderr, exitCode } = await run(root, ["install"], cache(root));
-      expect(stderr).not.toContain("error:");
+      expect(await run(root, ["install"], cache(root))).toMatchObject({
+        stderr: expect.not.stringContaining("error:"),
+        exitCode: 0,
+      });
       expect(await ran(root)).toBeFalse();
-      expect(exitCode).toBe(0);
     }
 
-    async function expectTrusted(root: string, manifest: object) {
+    const trusted = {
+      stdout: expect.stringContaining("1 script ran across 1 package"),
+      stderr: expect.not.stringContaining("error:"),
+      exitCode: 0,
+    };
+
+    async function expectRecorded(root: string, manifest: object) {
       expect(await ran(root)).toBeTrue();
       expect(await Bun.file(join(root, "package.json")).json()).toEqual({ ...manifest, trustedDependencies: ["q"] });
       expect(await Bun.file(join(root, "bun.lock")).text()).toContain(`"trustedDependencies": [\n    "q",\n  ],`);
@@ -80,11 +86,8 @@ describe.each(dialects)("a package.json with %s", (_, write) => {
       const root = String(dir);
       await installUntrusted(root);
 
-      const { stdout, stderr, exitCode } = await run(root, ["pm", "trust", "q"], cache(root));
-      expect(stderr).not.toContain("error:");
-      expect(stdout).toContain("1 script ran across 1 package");
-      await expectTrusted(root, manifest);
-      expect(exitCode).toBe(0);
+      expect(await run(root, ["pm", "trust", "q"], cache(root))).toEqual(trusted);
+      await expectRecorded(root, manifest);
     });
 
     test("--all from a workspace member records the trust in the workspace root", async () => {
@@ -97,11 +100,8 @@ describe.each(dialects)("a package.json with %s", (_, write) => {
       await installUntrusted(root);
 
       const member = join(root, "packages", "member");
-      const { stdout, stderr, exitCode } = await run(member, ["pm", "trust", "--all"], cache(root));
-      expect(stderr).not.toContain("error:");
-      expect(stdout).toContain("1 script ran across 1 package");
-      await expectTrusted(root, manifest);
-      expect(exitCode).toBe(0);
+      expect(await run(member, ["pm", "trust", "--all"], cache(root))).toEqual(trusted);
+      await expectRecorded(root, manifest);
     });
   });
 
@@ -170,47 +170,24 @@ describe.each(dialects)("a package.json with %s", (_, write) => {
     });
   });
 
-  describe.concurrent("bun create", () => {
+  // A template from GitHub takes the same read. Its cases are in bun-create.test.ts, with the other GitHub templates.
+  test.concurrent("bun create: a local template gets the package.json transforms", async () => {
     const template = { name: "template", version: "1.0.0", "bun-create": { start: "bun run go" } };
-
-    test("a local template gets the package.json transforms", async () => {
-      using dir = tempDir("package-json-comments-create", {
-        "templates/template/package.json": write(template),
-      });
-
-      const { stdout, stderr, exitCode } = await run(String(dir), ["create", "template", "dest", "--no-git"], {
-        BUN_CREATE_DIR: join(String(dir), "templates"),
-      });
-      expect(stderr).not.toContain("error:");
-      expect(stdout).toContain("\n  cd dest\n  bun run go\n");
-      expect(await Bun.file(join(String(dir), "dest", "package.json")).json()).toEqual({
-        name: "dest",
-        version: "1.0.0",
-      });
-      expect(exitCode).toBe(0);
+    using dir = tempDir("package-json-comments-create", {
+      "templates/template/package.json": write(template),
     });
 
-    test("a GitHub template gets the package.json transforms", async () => {
-      using dir = tempDir("package-json-comments-create-github", {});
-      const body = await tarball({ "template-main/package.json": write(template) });
-      using github = Bun.serve({
-        tls,
-        port: 0,
-        fetch: () => new Response(body, { headers: { "content-type": "application/x-gzip" } }),
-      });
-
-      const { stdout, stderr, exitCode } = await run(
-        String(dir),
-        ["create", "github.com/owner/template", "dest", "--no-install", "--no-git"],
-        { NODE_TLS_REJECT_UNAUTHORIZED: "0", GITHUB_API_DOMAIN: `${github.hostname}:${github.port}` },
-      );
-      expect(stderr).not.toContain("error:");
-      expect(stdout).toContain("\n  cd dest\n  bun run go\n");
-      expect(await Bun.file(join(String(dir), "dest", "package.json")).json()).toEqual({
-        name: "dest",
-        version: "1.0.0",
-      });
-      expect(exitCode).toBe(0);
+    const created = await run(String(dir), ["create", "template", "dest", "--no-git"], {
+      BUN_CREATE_DIR: join(String(dir), "templates"),
+    });
+    expect(created).toEqual({
+      stdout: expect.stringContaining("\n  cd dest\n  bun run go\n"),
+      stderr: expect.not.stringContaining("error:"),
+      exitCode: 0,
+    });
+    expect(await Bun.file(join(String(dir), "dest", "package.json")).json()).toEqual({
+      name: "dest",
+      version: "1.0.0",
     });
   });
 });
