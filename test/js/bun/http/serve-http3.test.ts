@@ -1678,30 +1678,42 @@ describe("Bun.serve HTTP/3 req.body", () => {
     return body;
   }
 
-  test("is null for a request that fetch() sends without a body", async () => {
+  // The node:quic client sends no content-length and ends the stream with the header block.
+  test("is null for a request whose stream ends with its header block", async () => {
     const { server } = serve();
     await using _ = server;
     const results: Record<string, string> = {};
-    for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "PROPFIND"]) {
+    for (const method of ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "PROPFIND"]) {
+      results[method] = await h3Exchange(server.port!, requestHeaders("/", { ":method": method }));
+    }
+    expect(results).toEqual({
+      POST: '200 null ""',
+      PUT: '200 null ""',
+      PATCH: '200 null ""',
+      DELETE: '200 null ""',
+      OPTIONS: '200 null ""',
+      PROPFIND: '200 null ""',
+    });
+  });
+
+  // fetch() sends content-length: 0 with a request that has no body.
+  test("is null for content-length: 0, also on a stream that is still open", async () => {
+    const { server, hooks } = serve();
+    await using _ = server;
+    const results: Record<string, string> = {};
+    for (const method of ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "PROPFIND"]) {
       results[method] = await (await fetchH3(server.port!, "/", { method })).text();
     }
-    results["POST with an empty body"] = await (await fetchH3(server.port!, "/", { method: "POST", body: "" })).text();
+    results["stream still open"] = await endAfterDispatch(server, hooks, { "content-length": "0" });
     expect(results).toEqual({
-      GET: 'null ""',
       POST: 'null ""',
       PUT: 'null ""',
       PATCH: 'null ""',
       DELETE: 'null ""',
       OPTIONS: 'null ""',
       PROPFIND: 'null ""',
-      "POST with an empty body": 'null ""',
+      "stream still open": 'null ""',
     });
-  });
-
-  test("is null for content-length: 0 on a stream that is still open", async () => {
-    const { server, hooks } = serve();
-    await using _ = server;
-    expect(await endAfterDispatch(server, hooks, { "content-length": "0" })).toBe('null ""');
   });
 
   test("is a stream when the request can still carry bytes", async () => {
