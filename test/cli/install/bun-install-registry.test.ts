@@ -3251,7 +3251,12 @@ describe("binaries", () => {
   // A package names its commands in `bin`. When an installed package changes to a version that
   // declares other commands, the links of the commands it no longer declares have to go.
   describe.concurrent("a version change that drops bins", () => {
-    type Version = { bin?: Record<string, string>; directories?: { bin: string }; files: string[] };
+    type Version = {
+      bin?: Record<string, string>;
+      directories?: { bin: string };
+      dependencies?: Record<string, string>;
+      files: string[];
+    };
     const packages: Record<string, Record<string, Version>> = {
       "tool-a": {
         "1.0.0": {
@@ -3275,6 +3280,9 @@ describe("binaries", () => {
       "tool-d": {
         "1.0.0": { directories: { bin: "cmds" }, files: ["cmds/d-one", "cmds/d-two"] },
         "2.0.0": { directories: { bin: "cmds" }, files: ["cmds/d-one"] },
+      },
+      "uses-tool-a": {
+        "1.0.0": { dependencies: { "tool-a": "<=2.0.0" }, files: ["index.js"] },
       },
     };
     const v1 = ["old-only", "renamed-v1", "tool-a"];
@@ -3359,6 +3367,26 @@ describe("binaries", () => {
     }
 
     const binDirOf = (cwd: string) => join(cwd, "node_modules", ".bin");
+
+    /** The names of the bins in `binDir`. A bin on Windows is a `.exe` and a `.bunx` file. */
+    async function binNames(binDir: string) {
+      const names = (await readdirSorted(binDir)).map(name => (isWindows ? name.replace(/\.(exe|bunx)$/, "") : name));
+      return [...new Set(names)];
+    }
+
+    /** Makes `name` in `binDir` a bin that leads to `target`, a path relative to `binDir`. */
+    async function writeBin(binDir: string, name: string, target: string) {
+      if (isWindows) {
+        // A shim takes its target from the start of `<name>.bunx`: UTF-16, relative to the parent of `binDir`.
+        await Promise.all([
+          write(join(binDir, `${name}.bunx`), Buffer.from(`${target.slice(3)}"\0`, "utf16le")),
+          write(join(binDir, `${name}.exe`), ""),
+        ]);
+      } else {
+        await rm(join(binDir, name), { force: true });
+        await symlink(target, join(binDir, name));
+      }
+    }
 
     for (const linker of ["hoisted", "isolated"]) {
       test(`bun install (${linker})`, async () => {
@@ -3482,24 +3510,73 @@ describe("binaries", () => {
         expect(await bins()).toHaveBins([...v2, "tool-b"]);
       });
 
-      // A bin on Windows is a pair of shim files, and nothing else makes those.
-      test.skipIf(isWindows)(`entries that are not the bins of the old version stay (${linker})`, async () => {
+      test(`entries that are not the bins of the old version stay (${linker})`, async () => {
         await using registry = serveRegistry();
         using dir = projectDir(registry.url.href, linker, { "mine.js": "" });
         const cwd = String(dir);
         const binDir = binDirOf(cwd);
 
         await install(cwd, { "tool-a": "1.0.0" });
-        // A link into the package that no version declares. A tool can make one for itself.
-        await symlink(join("..", "tool-a", "bin", "shared.js"), join(binDir, "tool-made"));
-        // A name of the old version that now links to another file.
-        await rm(join(binDir, "old-only"));
-        await symlink(join("..", "..", "mine.js"), join(binDir, "old-only"));
+        // A bin into the package that no version declares. A tool can make one for itself.
+        await writeBin(binDir, "tool-made", join("..", "tool-a", "bin", "shared.js"));
+        // A name of the old version that now leads to another file.
+        await writeBin(binDir, "old-only", join("..", "..", "mine.js"));
 
         await install(cwd, { "tool-a": "2.0.0" });
-        expect(await readdirSorted(binDir)).toEqual(["new-only", "old-only", "renamed-v2", "tool-a", "tool-made"]);
-        expect(await readlink(join(binDir, "old-only"))).toBe(join("..", "..", "mine.js"));
-        expect(await readlink(join(binDir, "tool-made"))).toBe(join("..", "tool-a", "bin", "shared.js"));
+        expect(await readdirSorted(binDir)).toHaveBins(["new-only", "old-only", "renamed-v2", "tool-a", "tool-made"]);
+        expect(join(binDir, "old-only")).toBeValidBin(join("..", "..", "mine.js"));
+        expect(join(binDir, "tool-made")).toBeValidBin(join("..", "tool-a", "bin", "shared.js"));
+      });
+
+      // `bun install` links no bin whose file is missing, and it keeps the link that is there.
+      test(`the bin of a workspace keeps its link while its file is missing (${linker})`, async () => {
+        await using registry = serveRegistry();
+        using dir = projectDir(registry.url.href, linker, {
+          "package.json": JSON.stringify({
+            name: "app",
+            workspaces: ["packages/*"],
+            dependencies: { pkg1: "workspace:*" },
+          }),
+          "packages/pkg1/package.json": JSON.stringify({
+            name: "pkg1",
+            version: "1.0.0",
+            bin: { "pkg1-cli": "dist/cli.js" },
+          }),
+          "packages/pkg1/dist/cli.js": "#!/usr/bin/env node\n",
+        });
+        const cwd = String(dir);
+
+        await bun(cwd, ["install"]);
+        expect(await readdirSorted(binDirOf(cwd))).toHaveBins(["pkg1-cli"]);
+
+        await rm(join(cwd, "packages", "pkg1", "dist"), { recursive: true });
+        await bun(cwd, ["install"]);
+        await bun(cwd, ["install", "--force"]);
+        expect(await readdirSorted(binDirOf(cwd))).toHaveBins(["pkg1-cli"]);
+      });
+    }
+
+    // The node_modules of an isolated store entry has the bins of the dependencies of the package.
+    for (const force of [false, true]) {
+      test(`the .bin of an isolated store entry${force ? " (--force)" : ""}`, async () => {
+        await using registry = serveRegistry();
+        using dir = projectDir(registry.url.href, "isolated");
+        const cwd = String(dir);
+        const bins = () =>
+          readdirSorted(join(cwd, "node_modules", ".bun", "uses-tool-a@1.0.0", "node_modules", ".bin"));
+        const installWith = async (toolA: string) => {
+          await write(
+            join(cwd, "package.json"),
+            JSON.stringify({ name: "app", dependencies: { "uses-tool-a": "1.0.0" }, overrides: { "tool-a": toolA } }),
+          );
+          await bun(cwd, force ? ["install", "--force"] : ["install"]);
+        };
+
+        await installWith("1.0.0");
+        expect(await bins()).toHaveBins(v1);
+
+        await installWith("2.0.0");
+        expect(await bins()).toHaveBins(v2);
       });
     }
 
@@ -3525,6 +3602,101 @@ describe("binaries", () => {
 
       expect(await installGlobal("tool-a@3.0.0")).toContain("tool-a@3.0.0");
       expect(await readdirSorted(binDir)).toHaveBins(["tool-a"]);
+    });
+
+    // Only the packages that a command names get their bins linked into the global bin dir, so
+    // this update links none there. The bins that the new version drops go all the same.
+    test("bun update -g with no package names", async () => {
+      await using registry = serveRegistry();
+      using dir = tempDir("global-bins-of-an-update", {});
+      const cwd = String(dir);
+      const binDir = join(cwd, "global-bin-dir");
+      const globalDir = join(cwd, "global-install-dir", "install", "global");
+      await write(
+        join(cwd, "bunfig.toml"),
+        Bun.TOML.stringify({ install: { cache: false, registry: registry.url.href, globalBinDir: binDir } }),
+      );
+      const global = (...args: string[]) =>
+        bun(cwd, [...args, "--linker=hoisted", "-g", `--config=${join(cwd, "bunfig.toml")}`], {
+          BUN_INSTALL: join(cwd, "global-install-dir"),
+        });
+
+      await global("install", "tool-a@1.0.0");
+      expect(await readdirSorted(binDir)).toHaveBins(v1);
+
+      // What else a global bin dir holds: a bin that a tool made for itself, and the files of the user.
+      const toolA = join("..", "global-install-dir", "install", "global", "node_modules", "tool-a");
+      await writeBin(binDir, "tool-made", join(toolA, "bin", "shared.js"));
+      const kept = ["tool-a", "tool-made"];
+      if (!isWindows) {
+        await Promise.all([
+          write(join(binDir, "bun"), "the bun executable"),
+          symlink("bun", join(binDir, "bunx")),
+          symlink(join(cwd, "gone"), join(binDir, "user-dangling")),
+        ]);
+        kept.push("bun", "bunx", "user-dangling");
+      }
+      const inodes = () =>
+        Promise.all(kept.map(async name => (await lstat(join(binDir, isWindows ? `${name}.bunx` : name))).ino));
+      const inodesBefore = await inodes();
+
+      await write(join(globalDir, "package.json"), JSON.stringify({ dependencies: { "tool-a": "<=2.0.0" } }));
+      await global("update");
+      expect(await file(join(globalDir, "node_modules", "tool-a", "package.json")).json()).toMatchObject({
+        version: "2.0.0",
+      });
+
+      const names = await binNames(binDir);
+      expect(names).toEqual(expect.arrayContaining(kept));
+      expect(names).not.toContain("old-only");
+      expect(names).not.toContain("renamed-v1");
+      expect(await inodes()).toEqual(inodesBefore);
+    });
+
+    test("bun link over a name that another package has", async () => {
+      const script = "#!/usr/bin/env node\n";
+      using dir = tempDir("bins-of-a-linked-package", {
+        "first/package.json": JSON.stringify({
+          name: "linked-tool",
+          version: "1.0.0",
+          bin: { "linked-tool": "cli.js", "first-only": "cli.js" },
+        }),
+        "first/cli.js": script,
+        "second/package.json": JSON.stringify({
+          name: "linked-tool",
+          version: "2.0.0",
+          bin: { "linked-tool": "cli.js", "second-only": "cli.js" },
+        }),
+        "second/cli.js": script,
+      });
+      const cwd = String(dir);
+      const link = (from: string) => bun(join(cwd, from), ["link"], { BUN_INSTALL: join(cwd, "bun-install") });
+      const binDir = join(cwd, "bun-install", "bin");
+
+      expect(await link("first")).toContain(`Registered "linked-tool"`);
+      expect(await readdirSorted(binDir)).toHaveBins(["first-only", "linked-tool"]);
+
+      expect(await link("second")).toContain(`Registered "linked-tool"`);
+      expect(await readdirSorted(binDir)).toHaveBins(["linked-tool", "second-only"]);
+    });
+
+    // `bun link` links no file of a `directories.bin` folder outside the package, so there is
+    // no bin for `bun unlink` to remove. This folder is the global bin dir itself.
+    test("bun unlink when `directories.bin` is outside the package", async () => {
+      using dir = tempDir("bins-outside-the-package", {
+        "pkg/package.json": JSON.stringify({
+          name: "bin-dir-outside",
+          version: "1.0.0",
+          directories: { bin: "../../../../bin" },
+        }),
+        "bun-install/bin/mine": "a file of the user",
+      });
+      const cwd = String(dir);
+      const run = (command: string) => bun(join(cwd, "pkg"), [command], { BUN_INSTALL: join(cwd, "bun-install") });
+
+      expect(await run("link")).toContain(`Registered "bin-dir-outside"`);
+      expect(await run("unlink")).toContain(`unlinked package "bin-dir-outside"`);
+      expect(await readdirSorted(join(cwd, "bun-install", "bin"))).toEqual(["mine"]);
     });
   });
 
