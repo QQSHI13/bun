@@ -2259,6 +2259,7 @@ impl<'a> Installer<'a> {
         let base_len = dest.len();
 
         let mut changed = false;
+        let mut has_bin_dir: Option<bool> = None;
         for dep in self.store.entries.items_dependencies()[entry_id.get() as usize].slice() {
             let dep_name = dependencies[dep.dep_id as usize].name.slice(string_buf);
 
@@ -2299,6 +2300,7 @@ impl<'a> Installer<'a> {
                 // The bin dir of this entry links a nested dependency through the entry itself.
                 if !is_nested {
                     self.unlink_dropped_dependency_bins(
+                        &mut has_bin_dir,
                         &dest.slice()[..base_len],
                         dest.slice(),
                         dep_name,
@@ -2313,16 +2315,31 @@ impl<'a> Installer<'a> {
     }
 
     /// The link `dep_link` in `node_modules_path` led to `old_target` and
-    /// leads to the store entry `dep_entry_id` now.
+    /// leads to the store entry `dep_entry_id` now. `has_bin_dir` is whether
+    /// `node_modules_path` has a `.bin`, once that is known.
     #[cold]
     fn unlink_dropped_dependency_bins(
         &self,
+        has_bin_dir: &mut Option<bool>,
         node_modules_path: &[u8],
         dep_link: &[u8],
         dep_name: &[u8],
         dep_entry_id: StoreEntryId,
         old_target: &[u8],
     ) {
+        // Most store entries have none: no dependency of the package declares a bin.
+        if !*has_bin_dir.get_or_insert_with(|| {
+            let mut bin_dir_buf = paths::path_buffer_pool::get();
+            paths::resolve_path::join_abs_string_buf_checked::<paths::platform::Auto>(
+                node_modules_path,
+                &mut bin_dir_buf[..],
+                &[b".bin"],
+            )
+            .is_some_and(sys::exists)
+        }) {
+            return;
+        }
+
         // The text of a link is relative to the directory the link is in.
         let mut outgoing_dir_buf = paths::path_buffer_pool::get();
         let Some(outgoing_dir) =
