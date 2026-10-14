@@ -552,12 +552,12 @@ impl TrustCommand {
 
         let bump = Bump::new();
         // SAFETY: `ctx.log` set by `Command::init`, non-null for the command.
-        // Layering: `parse_utf8` returns the T2
+        // Layering: `parse_package_json_utf8` returns the T2
         // `bun_ast::Expr`; `PackageJSONEditor` and
         // `js_printer::print_json` consume the T4 `bun_ast::Expr`. Lift
         // once via `From<T2> for T4` (same as `updatePackageJSONAndInstall` /
         // `pack_command`).
-        let mut package_json: bun_ast::Expr = match bun_parsers::json::parse_utf8(
+        let mut package_json: bun_ast::Expr = match bun_parsers::json::parse_package_json_utf8(
             &package_json_source,
             unsafe { ctx.log_mut() },
             &bump,

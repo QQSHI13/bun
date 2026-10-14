@@ -331,7 +331,7 @@ fn package_name_in(tree: &Tree) -> Option<Vec<u8>> {
     let bytes = tree.files.get(b"package.json".as_slice())?;
     let bump = Bump::new();
     let src: &[u8] = bump.alloc_slice_copy(bytes);
-    let json = bun_parsers::json::parse_utf8(
+    let json = bun_parsers::json::parse_package_json_utf8(
         &bun_ast::Source::init_path_string(b"package.json", src),
         &mut bun_ast::Log::init(),
         &bump,
@@ -374,7 +374,7 @@ fn root_package_name(pm: &PackageManager, original_cwd: &[u8]) -> Vec<u8> {
     if let Ok(bytes) = bun_sys::File::read_from(Fd::cwd(), &path) {
         let bump = Bump::new();
         let src: &[u8] = bump.alloc_slice_copy(&bytes);
-        if let Ok(json) = bun_parsers::json::parse_utf8(
+        if let Ok(json) = bun_parsers::json::parse_package_json_utf8(
             &bun_ast::Source::init_path_string(b"package.json", src),
             &mut bun_ast::Log::init(),
             &bump,
@@ -588,7 +588,7 @@ fn read_dir_tree(root: &[u8]) -> Result<Tree, crate::Error> {
         if let Ok(pkg) = bun_sys::File::read_from(root_fd, b"package.json") {
             let bump = Bump::new();
             let src: &[u8] = bump.alloc_slice_copy(&pkg);
-            if let Ok(json) = bun_parsers::json::parse_utf8(
+            if let Ok(json) = bun_parsers::json::parse_package_json_utf8(
                 &bun_ast::Source::init_path_string(b"package.json", src),
                 &mut bun_ast::Log::init(),
                 &bump,
@@ -1903,7 +1903,7 @@ fn package_json_notes(
     let bump = Bump::new();
     let parse = |bytes: &[u8]| {
         let src: &[u8] = bump.alloc_slice_copy(bytes);
-        bun_parsers::json::parse_utf8(
+        bun_parsers::json::parse_package_json_utf8(
             &bun_ast::Source::init_path_string(b"package.json", src),
             &mut bun_ast::Log::init(),
             &bump,
