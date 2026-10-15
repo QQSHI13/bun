@@ -5,6 +5,8 @@ interface NativeHandle {
   resume(): void;
   close(): void;
   end(): void;
+  ref(): void;
+  unref(): void;
   $write(chunk: Buffer, encoding: string): boolean;
   alpnProtocol?: string;
 }
@@ -48,6 +50,8 @@ interface TLSProxySocket extends DuplexStream {
   secureConnecting: boolean;
   _secureEstablished: boolean;
   authorizationError?: string;
+  ref(): this;
+  unref(): this;
 }
 
 /**
@@ -125,6 +129,18 @@ function tlsSocketDestroy(this: TLSProxySocket, err: Error | null, callback: (er
 // _final: called when the writable side is ending (all data flushed).
 // Shuts down the TLS write side gracefully.
 // Mirrors net.ts Socket.prototype._final.
+// The TLS engine has no fd: it passes both to the handle of the raw socket, as TLSWrap does.
+// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L635-L654
+function tlsSocketRef(this: TLSProxySocket) {
+  this._ctx.nativeHandle?.ref();
+  return this;
+}
+
+function tlsSocketUnref(this: TLSProxySocket) {
+  this._ctx.nativeHandle?.unref();
+  return this;
+}
+
 function tlsSocketFinal(this: TLSProxySocket, callback: () => void) {
   const h = this._ctx.nativeHandle;
   if (!h) return callback();
@@ -319,6 +335,8 @@ function upgradeRawSocketToH2(
   tlsSocket._write = tlsSocketWrite;
   tlsSocket._destroy = tlsSocketDestroy;
   tlsSocket._final = tlsSocketFinal;
+  tlsSocket.ref = tlsSocketRef;
+  tlsSocket.unref = tlsSocketUnref;
 
   // Suppress unhandled error events until the H2 session attaches its own error handler
   tlsSocket.on("error", noop);
@@ -372,8 +390,10 @@ function upgradeRawSocketToH2(
         error: socketError.bind(tlsSocket),
         timeout: socketTimeout.bind(tlsSocket),
         handshake: socketHandshake.bind(tlsSocket),
+        holdLikeLibuv: true,
       },
       data: {},
+      transport: rawSocket._handle,
     });
   } catch (e) {
     rawSocket.destroy(e as Error);
