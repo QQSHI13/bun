@@ -487,16 +487,9 @@ impl PackageManager {
                 continue;
             };
             let name = dep.name.slice(buf);
-            // The registry names an npm package, and a workspace runs its scripts without trust.
-            if !matches!(
-                resolution.tag,
-                ResolutionTag::Folder
-                    | ResolutionTag::LocalTarball
-                    | ResolutionTag::RemoteTarball
-                    | ResolutionTag::Git
-                    | ResolutionTag::Github
-                    | ResolutionTag::Symlink
-            ) || !lockfile.has_trusted_dependency(name, name, resolution)
+            // The registry names an npm package. A workspace member has the root's own row for it.
+            if resolution.tag == ResolutionTag::Npm
+                || !lockfile.has_trusted_dependency(name, name, resolution)
                 || lockfile.declared_by_root_or_workspace(name, resolution, &unbacked)
             {
                 continue;
