@@ -453,6 +453,9 @@ pub struct PackageManager {
     pub(crate) kept_patched: Vec<PackageID>,
     pub kept_patched_text: Vec<u8>,
 
+    // Rows that took their name from the package they resolved to (`bun add <path|url>`, a package.json key equal to its value); drained by PackageManagerLifecycle::refuse_trust_by_own_name.
+    pub(crate) named_by_resolution: Vec<DependencyID>,
+
     // Newly resolved deprecated versions no package.json of the project names: one summary line.
     pub(crate) deprecated_transitive: u32,
 
@@ -1536,6 +1539,7 @@ fn allocate_package_manager(
         wr!(named_update_reachable, None);
         wr!(kept_patched, Vec::new());
         wr!(kept_patched_text, Vec::new());
+        wr!(named_by_resolution, Vec::new());
         wr!(deprecated_transitive, 0);
         wr!(dedupe_report, None);
         wr!(filtered_link_targets, None);

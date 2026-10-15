@@ -4,9 +4,9 @@ use std::io::Write as _;
 
 use bstr::BStr;
 
-use bun_collections::ArrayHashMap;
+use bun_collections::{ArrayHashMap, index_sort};
 use bun_core::fmt::PathSep;
-use bun_core::{Output, ZBox, fmt as bun_fmt, handle_oom};
+use bun_core::{Global, Output, ZBox, fmt as bun_fmt, handle_oom};
 use bun_core::{ZStr, strings};
 use bun_paths::resolve_path::{join_abs_string_z, platform};
 use bun_paths::{AutoAbsPath, EnvPath};
@@ -18,6 +18,7 @@ use crate::bun_json;
 use crate::initialize_store;
 
 use super::directories;
+use crate::dependency::Tag as DependencyVersionTag;
 use crate::lifecycle_script_runner::{
     InstallCtx, LifecycleScriptSubprocess as RealLifecycleScriptSubprocess,
 };
@@ -434,6 +435,123 @@ impl PackageManager {
         }
 
         set
+    }
+
+    /// Runs after resolution, before the fold of bare positionals and the clean. A tarball, folder or git package is trusted by the name of its root or workspace row, which a person is expected to have written. A row in `named_by_resolution` took that name from its package, so the package would pick its own trust. Refused when `has_trusted_dependency` says yes only through such rows, unless `--trust` covers the request. A package with no lifecycle scripts is refused too: the name is saved, and a later version can add them.
+    #[inline]
+    pub(crate) fn refuse_trust_by_own_name(&mut self) {
+        if self.named_by_resolution.is_empty() {
+            return;
+        }
+        self.refuse_trust_by_own_name_slow();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn refuse_trust_by_own_name_slow(&mut self) {
+        let mut named = core::mem::take(&mut self.named_by_resolution);
+        index_sort::sort_indices_unstable(&mut named, &mut |a, b| a.cmp(&b));
+        named.dedup();
+
+        let lockfile: &Lockfile = &self.lockfile;
+        let buf = lockfile.buffers.string_bytes.as_slice();
+        let rows = lockfile.buffers.dependencies.as_slice();
+        let resolved = lockfile.buffers.resolutions.as_slice();
+        let packages = lockfile.packages.slice();
+        let resolutions = packages.items_resolution();
+        let lists = packages.items_dependencies();
+        let Some(root_rows) = lists.first() else {
+            return;
+        };
+
+        // No written name in a current package.json backs these rows: the ones Bun named, and every row of a workspace that the root no longer has (the clean drops it).
+        let mut unbacked = named.clone();
+        for (owner, list) in lists.iter().enumerate().skip(1) {
+            let is_member = (root_rows.begin()..root_rows.end()).any(|row| {
+                rows[row as usize].behavior.is_workspace()
+                    && resolved[row as usize] as usize == owner
+            });
+            if resolutions[owner].tag == ResolutionTag::Workspace && !is_member {
+                unbacked.extend(list.begin()..list.end());
+            }
+        }
+        index_sort::sort_indices_unstable(&mut unbacked, &mut |a, b| a.cmp(&b));
+
+        let trust_from_args = self.options.do_.trust_dependencies_from_args();
+        let pending = self.pending_filtered_write.as_deref();
+        let mut refused = false;
+
+        for &row in &named {
+            let Some(dep) = rows.get(row as usize) else {
+                continue;
+            };
+            let Some(resolution) = resolutions.get(resolved[row as usize] as usize) else {
+                continue;
+            };
+            let owner = lockfile.get_workspace_pkg_if_workspace_dep(row);
+            let name = dep.name.slice(buf);
+            // The registry names an npm package, and a workspace runs its scripts without trust.
+            if !matches!(
+                resolution.tag,
+                ResolutionTag::Folder
+                    | ResolutionTag::LocalTarball
+                    | ResolutionTag::RemoteTarball
+                    | ResolutionTag::Git
+                    | ResolutionTag::Github
+                    | ResolutionTag::Symlink
+            ) || owner == invalid_package_id
+                || !lockfile.has_trusted_dependency(name, name, resolution)
+                || lockfile.has_trusted_dependency_without(name, name, resolution, &unbacked)
+            {
+                continue;
+            }
+            // `link:<name>`: the person wrote the name.
+            if dep.version.tag == DependencyVersionTag::Symlink
+                && dep.version.symlink().slice(buf) == name
+            {
+                continue;
+            }
+            if trust_from_args
+                && self.update_requests.iter().any(|request| {
+                    !request.is_aliased
+                        && request.matches_exactly(dep, buf)
+                        && lockfile
+                            .workspaces_of_update_request(
+                                pending,
+                                self.workspace_name_hash,
+                                request,
+                            )
+                            .contains(&owner)
+                })
+            {
+                continue;
+            }
+
+            let spec = bun_fmt::redacted(BStr::new(dep.version.literal.slice(buf))).to_string();
+            let manifest = match resolutions[owner as usize].tag {
+                ResolutionTag::Workspace => {
+                    let dir = resolutions[owner as usize].workspace().slice(buf);
+                    strings::concat(&[dir, b"/package.json"])
+                }
+                _ => Box::from(&b"package.json"[..]),
+            };
+            Output::flush();
+            Output::err_generic(
+                "{} has no name of its own, and Bun would name it {}, which is in trustedDependencies",
+                (bun_fmt::quote(spec.as_bytes()), bun_fmt::quote(name)),
+            );
+            bun_core::note!(
+                "a name in trustedDependencies lets a package run its lifecycle scripts. To allow that, write the entry yourself in {}: {}: {}. To keep them blocked, write another name.",
+                BStr::new(&manifest),
+                bun_fmt::quote(name),
+                bun_fmt::quote(spec.as_bytes()),
+            );
+            refused = true;
+        }
+
+        if refused {
+            Global::crash();
+        }
     }
 }
 

@@ -3193,6 +3193,17 @@ impl Lockfile {
         pkg_name: &[u8],
         resolution: &Resolution,
     ) -> bool {
+        self.has_trusted_dependency_without(alias, pkg_name, resolution, &[])
+    }
+
+    /// `has_trusted_dependency` when the rows in `without` (sorted) declare nothing.
+    pub(crate) fn has_trusted_dependency_without(
+        &self,
+        alias: &[u8],
+        pkg_name: &[u8],
+        resolution: &Resolution,
+        without: &[DependencyID],
+    ) -> bool {
         if let Some(trusted_dependencies) = &self.trusted_dependencies {
             let trusted_name = resolution.trusted_name(alias, pkg_name);
             let hash = SemverStringBuilder::string_hash(trusted_name) as u32;
@@ -3206,7 +3217,7 @@ impl Lockfile {
             if resolution.tag == ResolutionTag::Npm {
                 return true;
             }
-            return self.declared_by_root_or_workspace(alias, resolution);
+            return self.declared_by_root_or_workspace(alias, resolution, without);
         }
 
         // Only allow default trusted dependencies for npm packages. Check the
@@ -3243,7 +3254,12 @@ impl Lockfile {
         url == canonical_url.as_slice()
     }
 
-    fn declared_by_root_or_workspace(&self, alias: &[u8], resolution: &Resolution) -> bool {
+    fn declared_by_root_or_workspace(
+        &self,
+        alias: &[u8],
+        resolution: &Resolution,
+        without: &[DependencyID],
+    ) -> bool {
         let buf = self.buffers.string_bytes.as_slice();
         let packages = self.packages.slice();
         let resolutions = packages.items_resolution();
@@ -3256,7 +3272,7 @@ impl Lockfile {
             }
             for dep_id in dependencies.begin()..dependencies.end() {
                 let dep = &self.buffers.dependencies[dep_id as usize];
-                if dep.name.slice(buf) != alias {
+                if dep.name.slice(buf) != alias || without.binary_search(&dep_id).is_ok() {
                     continue;
                 }
                 let package_id = self.buffers.resolutions[dep_id as usize];
