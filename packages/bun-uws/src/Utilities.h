@@ -60,13 +60,28 @@ static inline bool isKnownMethod(std::string_view method) {
     return !method.empty() && (unsigned char) (method[0] - 'A') < 26 && Bun__HTTPMethod__from(method.data(), method.size()) != -1;
 }
 
+/* One of the 8 bytes of `word` is a control byte or SP. */
+constexpr bool wordHasControlOrSpace(uint64_t word) {
+    return ((word - 0x2121212121212121ull) & ~word & 0x8080808080808080ull) != 0;
+}
+static_assert([] {
+    for (uint64_t others = 0x2121212121212121ull; others; others = others == ~0ull ? 0 : ~0ull) {
+        for (unsigned lane = 0; lane < 64; lane += 8) {
+            for (uint64_t b = 0; b < 256; b++) {
+                if (wordHasControlOrSpace((others & ~(0xffull << lane)) | (b << lane)) != (b <= 0x20)) return false;
+            }
+        }
+    }
+    return true;
+}(), "wordHasControlOrSpace() is `byte <= 0x20` for every byte value in every lane");
+
 /* A control byte or SP: what an HTTP/1 request-target cannot carry. */
 static inline bool hasControlOrSpace(std::string_view s) {
     const char *p = s.data(), *end = p + s.size();
     for (; end - p >= 8; p += 8) {
         uint64_t word;
         memcpy(&word, p, 8);
-        if ((word - 0x2121212121212121ull) & ~word & 0x8080808080808080ull) return true;
+        if (wordHasControlOrSpace(word)) return true;
     }
     for (; p != end; p++) if ((unsigned char) *p <= 0x20) return true;
     return false;

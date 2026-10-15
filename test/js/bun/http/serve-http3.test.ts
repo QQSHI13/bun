@@ -1756,9 +1756,7 @@ const requestHeaders = (path: string, extra: Record<string, string> = {}) => ({
   ...extra,
 });
 
-/** One QUIC session; each `request` is one stream on it and resolves to
- * `"<status> <body>"`, with an `"info <status>"` entry pushed to `seen` for
- * every 1xx. A session that closes fails the pending request with its reason. */
+/** One QUIC session. `request` opens a stream and resolves to `"<status> <body>"`, or to `"session closed <reason>"`. It pushes `"info <status>"` to `seen` for each 1xx. */
 async function h3Session(port: number) {
   const endpoint = new QuicEndpoint();
   const client = await connect(`127.0.0.1:${port}`, {
@@ -1791,7 +1789,7 @@ async function h3Session(port: number) {
         for await (const batch of stream as AsyncIterable<Uint8Array[]>) {
           for (const chunk of batch) body += Buffer.from(chunk).toString("latin1");
         }
-        return `${status} ${body}`;
+        return status ? `${status} ${body}` : await closed;
       })();
       exchange.catch(() => {});
       return await Promise.race([exchange, closed]);
@@ -1880,6 +1878,202 @@ describe("Bun.serve HTTP/3 request validation", () => {
     });
   });
 
+  // The listener answers, before the router, a request line that Bun.serve's HTTP/2 listener refuses. `req.url` is still the URL parser's form of `:path`.
+  describe("request line", () => {
+    function serve(dir: string) {
+      const calls: string[] = [];
+      const inFlight = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const arm = (name: string) => () => {
+        calls.push(name);
+        return new Response(name);
+      };
+      const server = Bun.serve({
+        port: 0,
+        tls,
+        http3: true,
+        routes: {
+          "/guarded": { GET: arm("the GET arm"), POST: arm("the POST arm") },
+          "/static": new Response("static"),
+          "/file": Bun.file(join(dir, "file.txt")),
+        },
+        async fetch(req) {
+          calls.push(`${req.method} ${req.url}`);
+          if (req.url.endsWith("/slow")) {
+            inFlight.resolve();
+            await release.promise;
+          }
+          return new Response(`${req.method} ${req.url}`);
+        },
+      });
+      return { server, calls, inFlight, release };
+    }
+
+    test("501 for a method that is not one of Bun's, in any case, on every kind of route", async () => {
+      using dir = tempDir("serve-h3-request-line", { "file.txt": "file" });
+      const { server, calls, inFlight, release } = serve(String(dir));
+      await using _ = server;
+      await using session = await h3Session(server.port!);
+
+      // A request that is still in flight on the session when the refusals are sent.
+      const slow = session.request(requestHeaders("/slow"));
+      await Promise.race([
+        inFlight.promise,
+        slow.then(early => Promise.reject(new Error(`/slow ended before its handler ran: ${early}`))),
+      ]);
+
+      const methods = [
+        "BREW",
+        "DELETE2",
+        Buffer.alloc(300, "M").toString(),
+        "get",
+        "Post",
+        "head",
+        "patch",
+        "Patch",
+        "M_SEARCH",
+      ];
+      const results: Record<string, string> = {};
+      for (const path of ["/echo", "/guarded", "/static", "/file"]) {
+        for (const method of methods) {
+          results[`${method.slice(0, 8)} ${path}`] = await session.request(requestHeaders(path, { ":method": method }));
+        }
+      }
+      const expected = Object.fromEntries(Object.keys(results).map(row => [row, "501 "]));
+
+      // No 100 Continue ahead of a refusal.
+      const seen: string[] = [];
+      seen.push(await session.request(requestHeaders("/echo", { ":method": "BREW", expect: "100-continue" }), seen));
+
+      release.resolve();
+      const after = { slow: await slow, guarded: await session.request(requestHeaders("/guarded")) };
+      expect({ results, seen, after, calls }).toEqual({
+        results: expected,
+        seen: ["501 "],
+        after: { slow: "200 GET https://localhost/slow", guarded: "200 the GET arm" },
+        calls: ["GET https://localhost/slow", "the GET arm"],
+      });
+    });
+
+    test("400 for a request line that is malformed", async () => {
+      using dir = tempDir("serve-h3-request-line", { "file.txt": "file" });
+      const { server, calls } = serve(String(dir));
+      await using _ = server;
+      await using session = await h3Session(server.port!);
+
+      const { ":method": _method, ...noMethod } = requestHeaders("/echo");
+      const { ":authority": _authority, ...noAuthority } = requestHeaders("/echo");
+      const rows: Record<string, Record<string, string>> = {
+        "no :method": noMethod,
+        ":method with SP": requestHeaders("/echo", { ":method": "GET /x" }),
+        ":method with a control byte": requestHeaders("/echo", { ":method": "GE\x01T" }),
+        ":method with DEL": requestHeaders("/echo", { ":method": "GE\x7fT" }),
+        ":method with a byte above 0x7f": requestHeaders("/echo", { ":method": "GE\xe9T" }),
+        ":method with non-token bytes": requestHeaders("/echo", { ":method": "GET{}" }),
+        ":path with SP": requestHeaders("/a b"),
+        ":path with HTAB": requestHeaders("/sta\ttic"),
+        ":path with a control byte": requestHeaders("/echo\x01"),
+        ":path with SP as byte 8": requestHeaders("/static path"),
+        ":path with SP in bytes 9 to 16": requestHeaders("/static/file name.txt"),
+        ":path with SP after byte 8": requestHeaders("/abcdefgh i"),
+        ":path with a control byte after byte 8": requestHeaders("/abcdefgh\x01"),
+        ":path without a leading slash": requestHeaders("static"),
+        ":path * with GET": requestHeaders("*"),
+        "empty :path": requestHeaders(""),
+        "absolute-form :path": requestHeaders("https://other.invalid/static"),
+        "CONNECT with :path": requestHeaders("/static", { ":method": "CONNECT" }),
+        "no :authority and no host": noAuthority,
+        // 400 and not 501: a malformed request line wins over a method Bun does not have.
+        "unknown method and :path with SP": requestHeaders("/a b", { ":method": "BREW" }),
+        "unknown method and no :authority": { ...noAuthority, ":method": "BREW" },
+      };
+      const results: Record<string, string> = {};
+      for (const [row, headers] of Object.entries(rows)) results[row] = await session.request(headers);
+
+      // Bun's fetch sends :scheme and :path with CONNECT.
+      const fetchConnect = (await fetchH3(server.port!, "/echo", { method: "CONNECT" })).status;
+      // CR, LF and NUL do not reach this check: the QUIC layer refuses the header block and closes the connection.
+      const crInPath = await h3Exchange(server.port!, requestHeaders("/a\rb"));
+
+      expect({
+        results,
+        fetchConnect,
+        crInPath,
+        after: await session.request(requestHeaders("/static")),
+        calls,
+      }).toEqual({
+        results: Object.fromEntries(Object.keys(rows).map(row => [row, "400 "])),
+        fetchConnect: 400,
+        crInPath: "closed ERR_QUIC_APPLICATION_ERROR 270",
+        after: "200 static",
+        calls: [],
+      });
+    });
+
+    test("routes a request line that the HTTP/2 listener routes", async () => {
+      using dir = tempDir("serve-h3-request-line", { "file.txt": "file" });
+      const { server, calls } = serve(String(dir));
+      await using _ = server;
+      await using session = await h3Session(server.port!);
+
+      const methods =
+        "ACL BIND CHECKOUT COPY DELETE GET LINK LOCK M-SEARCH MERGE MKACTIVITY MKADDRESSBOOK MKCALENDAR MKCOL MOVE NOTIFY OPTIONS PATCH POST PROPFIND PROPPATCH PURGE PUT QUERY REBIND REPORT SEARCH SOURCE SUBSCRIBE TRACE UNBIND UNLINK UNLOCK UNSUBSCRIBE".split(
+          " ",
+        );
+      const { ":authority": _authority, ...noAuthority } = requestHeaders("/echo");
+      // A 16-byte :path: the scan reads it as two 8-byte words.
+      const long = (byte: number) => "/" + Buffer.alloc(15, byte).toString("latin1");
+      const url = (path: string) => "https://localhost" + path;
+      // Each row: name, request, response, and what the fetch handler saw (null when no handler ran).
+      type Row = [string, Record<string, string>, string, string | null];
+      const served = (name: string, headers: Record<string, string>, seen: string): Row => [
+        name,
+        headers,
+        "200 " + seen,
+        seen,
+      ];
+      const rows: Row[] = [
+        ...methods.map(method =>
+          served(method, requestHeaders("/echo", { ":method": method }), `${method} ${url("/echo")}`),
+        ),
+        ["HEAD", requestHeaders("/echo", { ":method": "HEAD" }), "200 ", "HEAD " + url("/echo")],
+        // No :path, so the router answers 404.
+        ["CONNECT without :path", { ":method": "CONNECT", ":authority": "localhost:443" }, "404 ", null],
+        // Accepted as over HTTP/2 (HTTP/1.1 answers 400). `req.url === "*"` is the current result, not a contract.
+        served("OPTIONS *", requestHeaders("*", { ":method": "OPTIONS" }), "OPTIONS *"),
+        served("host without :authority", { ...noAuthority, host: "localhost" }, "GET " + url("/echo")),
+        served("query and percent-encoding", requestHeaders("/echo%20a?b=c"), "GET " + url("/echo%20a?b=c")),
+        served("15 bytes of ! in :path", requestHeaders(long(0x21)), "GET " + url(long(0x21))),
+        // A byte that is not UTF-8 becomes U+FFFD in the URL parser, as over HTTP/1.1 and HTTP/2.
+        ...[0x80, 0xff].map(byte =>
+          served(
+            `15 bytes of 0x${byte.toString(16)} in :path`,
+            requestHeaders(long(byte)),
+            "GET " + url("/" + Buffer.alloc(135, "%EF%BF%BD").toString()),
+          ),
+        ),
+        // DEL passes this check, as over HTTP/2. These two rows are the current result, not a contract.
+        served(
+          "DEL and a byte above 0x7f in :path",
+          requestHeaders("/echo\x7f\xe9"),
+          "GET " + url("/echo%7F%EF%BF%BD"),
+        ),
+        served(
+          "15 bytes of DEL in :path",
+          requestHeaders(long(0x7f)),
+          "GET " + url("/" + Buffer.alloc(45, "%7F").toString()),
+        ),
+      ];
+      const results: Record<string, string> = {};
+      for (const [row, headers] of rows) results[row] = await session.request(headers);
+
+      expect({ results, calls }).toEqual({
+        results: Object.fromEntries(rows.map(([row, , response]) => [row, response])),
+        calls: rows.flatMap(([, , , call]) => call ?? []),
+      });
+    });
+  });
+
   test("request.url falls back to the :path when :authority is not a valid host", async () => {
     await using server = Bun.serve({
       port: 0,
@@ -1913,139 +2107,6 @@ describe("Bun.serve HTTP/3 request validation", () => {
       "example.com\\other:8080": "200 /index",
       "[::1]:3000?q": "200 /index",
       "example.com:8443": "200 https://example.com:8443/index",
-    });
-  });
-
-  // The request line of HTTP/3 is four pseudo-header values that QPACK delivers
-  // as sent. The listener answers them before the router, with the rules the
-  // HTTP/2 listener has: no handler and no route may see a method or a path
-  // that was not on the wire.
-  describe("refuses a request line before the router", () => {
-    function serve(dir: string) {
-      const inFlight = Promise.withResolvers<void>();
-      const release = Promise.withResolvers<void>();
-      const server = Bun.serve({
-        port: 0,
-        tls,
-        http3: true,
-        routes: {
-          "/guarded": { GET: () => new Response("the GET arm"), POST: () => new Response("the POST arm") },
-          "/static": new Response("static"),
-          "/file": Bun.file(join(dir, "file.txt")),
-        },
-        async fetch(req) {
-          if (req.url.endsWith("/slow")) {
-            inFlight.resolve();
-            await release.promise;
-          }
-          return new Response(`${req.method} ${req.url}`);
-        },
-      });
-      return { server, inFlight, release };
-    }
-
-    test("501 for a method that is not one of Bun's, in any case, on every kind of route", async () => {
-      using dir = tempDir("serve-h3-request-line", { "file.txt": "file" });
-      const { server, inFlight, release } = serve(String(dir));
-      await using _ = server;
-      await using session = await h3Session(server.port!);
-
-      // A request that is still in flight on the session when the refusals are sent.
-      const slow = session.request(requestHeaders("/slow"));
-      await inFlight.promise;
-
-      const methods = ["BREW", "DELETE2", Buffer.alloc(300, "M").toString(), "get", "Post", "head", "M_SEARCH"];
-      const results: Record<string, string> = {};
-      for (const path of ["/echo", "/guarded", "/static", "/file"]) {
-        for (const method of methods) {
-          results[`${method.slice(0, 8)} ${path}`] = await session.request(requestHeaders(path, { ":method": method }));
-        }
-      }
-      const expected = Object.fromEntries(Object.keys(results).map(row => [row, "501 "]));
-
-      // No 100 Continue ahead of a refusal.
-      const seen: string[] = [];
-      seen.push(await session.request(requestHeaders("/echo", { ":method": "BREW", expect: "100-continue" }), seen));
-
-      release.resolve();
-      expect({ results, seen, slow: await slow, after: await session.request(requestHeaders("/guarded")) }).toEqual({
-        results: expected,
-        seen: ["501 "],
-        slow: "200 GET https://localhost/slow",
-        after: "200 the GET arm",
-      });
-    });
-
-    test("400 for a request line that is malformed", async () => {
-      using dir = tempDir("serve-h3-request-line", { "file.txt": "file" });
-      const { server } = serve(String(dir));
-      await using _ = server;
-      await using session = await h3Session(server.port!);
-
-      const { ":method": _method, ...noMethod } = requestHeaders("/echo");
-      const { ":authority": _authority, ...noAuthority } = requestHeaders("/echo");
-      const rows: Record<string, Record<string, string>> = {
-        "no :method": noMethod,
-        ":method with SP": requestHeaders("/echo", { ":method": "GET /x" }),
-        ":method with a control byte": requestHeaders("/echo", { ":method": "GE\x01T" }),
-        ":path with SP": requestHeaders("/a b"),
-        ":path with HTAB": requestHeaders("/sta\ttic"),
-        ":path with a control byte": requestHeaders("/echo\x01"),
-        ":path without a leading slash": requestHeaders("static"),
-        ":path * with GET": requestHeaders("*"),
-        "empty :path": requestHeaders(""),
-        "absolute-form :path": requestHeaders("https://other.invalid/static"),
-        "CONNECT with :path": requestHeaders("/static", { ":method": "CONNECT" }),
-        "no :authority and no host": noAuthority,
-      };
-      const results: Record<string, string> = {};
-      for (const [row, headers] of Object.entries(rows)) results[row] = await session.request(headers);
-
-      expect({ results, after: await session.request(requestHeaders("/static")) }).toEqual({
-        results: Object.fromEntries(Object.keys(rows).map(row => [row, "400 "])),
-        after: "200 static",
-      });
-    });
-
-    test("serves every method Bun has and the request lines HTTP/1.1 and HTTP/2 serve", async () => {
-      using dir = tempDir("serve-h3-request-line", { "file.txt": "file" });
-      const { server } = serve(String(dir));
-      await using _ = server;
-      await using session = await h3Session(server.port!);
-
-      const methods =
-        "ACL BIND CHECKOUT COPY DELETE GET LINK LOCK M-SEARCH MERGE MKACTIVITY MKADDRESSBOOK MKCALENDAR MKCOL MOVE NOTIFY OPTIONS PATCH POST PROPFIND PROPPATCH PURGE PUT QUERY REBIND REPORT SEARCH SOURCE SUBSCRIBE TRACE UNBIND UNLINK UNLOCK UNSUBSCRIBE".split(
-          " ",
-        );
-      const results: Record<string, string> = {};
-      for (const method of methods) {
-        results[method] = await session.request(requestHeaders("/echo", { ":method": method }));
-      }
-      const expected: Record<string, string> = Object.fromEntries(
-        methods.map(method => [method, `200 ${method} https://localhost/echo`]),
-      );
-
-      const { ":authority": _authority, ...noAuthority } = requestHeaders("/echo");
-      const { ":path": _path, ...noPath } = requestHeaders("", { ":method": "CONNECT", ":authority": "localhost:443" });
-      const others: Record<string, [Record<string, string>, string]> = {
-        HEAD: [requestHeaders("/echo", { ":method": "HEAD" }), "200 "],
-        // Well-formed, and no route takes a request without a path.
-        "CONNECT without :path": [noPath, "404 "],
-        "OPTIONS *": [requestHeaders("*", { ":method": "OPTIONS" }), "200 OPTIONS *"],
-        "host without :authority": [{ ...noAuthority, host: "localhost" }, "200 GET https://localhost/echo"],
-        // The one byte 0xE9 is not UTF-8, so the URL parser writes U+FFFD, as it does over HTTP/1.1 and HTTP/2.
-        "DEL and a byte above 0x7f in :path": [
-          requestHeaders("/echo\x7f\xe9"),
-          "200 GET https://localhost/echo%7F%EF%BF%BD",
-        ],
-        "query and percent-encoding": [requestHeaders("/echo%20a?b=c"), "200 GET https://localhost/echo%20a?b=c"],
-      };
-      for (const [row, [headers, response]] of Object.entries(others)) {
-        results[row] = await session.request(headers);
-        expected[row] = response;
-      }
-
-      expect(results).toEqual(expected);
     });
   });
 
