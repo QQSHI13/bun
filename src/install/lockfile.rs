@@ -3193,17 +3193,6 @@ impl Lockfile {
         pkg_name: &[u8],
         resolution: &Resolution,
     ) -> bool {
-        self.has_trusted_dependency_without(alias, pkg_name, resolution, &[])
-    }
-
-    /// `has_trusted_dependency` when the rows in `without` (sorted) declare nothing.
-    pub(crate) fn has_trusted_dependency_without(
-        &self,
-        alias: &[u8],
-        pkg_name: &[u8],
-        resolution: &Resolution,
-        without: &[DependencyID],
-    ) -> bool {
         if let Some(trusted_dependencies) = &self.trusted_dependencies {
             let trusted_name = resolution.trusted_name(alias, pkg_name);
             let hash = SemverStringBuilder::string_hash(trusted_name) as u32;
@@ -3217,7 +3206,7 @@ impl Lockfile {
             if resolution.tag == ResolutionTag::Npm {
                 return true;
             }
-            return self.declared_by_root_or_workspace(alias, resolution, without);
+            return self.declared_by_root_or_workspace(alias, resolution, &[]);
         }
 
         // Only allow default trusted dependencies for npm packages. Check the
@@ -3254,7 +3243,8 @@ impl Lockfile {
         url == canonical_url.as_slice()
     }
 
-    fn declared_by_root_or_workspace(
+    /// Whether a root or workspace row named `alias`, other than the rows in `without` (sorted), resolves to `resolution`.
+    pub(crate) fn declared_by_root_or_workspace(
         &self,
         alias: &[u8],
         resolution: &Resolution,

@@ -3193,6 +3193,69 @@ describe.concurrent("a dependency that Bun names after its own package gets no t
     expect(exitCode).toBe(0);
   });
 
+  test("bun add <path of a workspace member> is accepted when the name of the member is in trustedDependencies", async () => {
+    using ctx = await setupTest();
+    const { packageDir, packageJson } = ctx;
+    await Promise.all([
+      workspace(packageDir, "a"),
+      workspace(packageDir, "electron", { scripts }),
+      write(
+        packageJson,
+        JSON.stringify({
+          name: "foo",
+          version: "1.0.0",
+          workspaces: ["packages/*"],
+          trustedDependencies: ["electron"],
+        }),
+      ),
+    ]);
+
+    const { err, exitCode } = await run(ctx, ["add", "../electron"], member(packageDir, "a"));
+
+    expect(err).not.toContain("error:");
+    expect(await file(join(member(packageDir, "a"), "package.json")).json()).toEqual({
+      name: "a",
+      version: "1.0.0",
+      dependencies: { electron: "workspace:*" },
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  test("an npm dependency whose key equals its dist-tag keeps the trust of its registry name", async () => {
+    using ctx = await setupTest();
+    const { packageDir, packageJson } = ctx;
+    const source = { name: "tagged", version: "1.0.0", scripts };
+    const tarball = await githubTarball("package", { "package.json": JSON.stringify(source) });
+    using registry = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const { origin, pathname } = new URL(request.url);
+        if (pathname.endsWith(".tgz")) return new Response(tarball);
+        const dist = { tarball: `${origin}/tagged/-/tagged-1.0.0.tgz` };
+        return Response.json({
+          name: "tagged",
+          "dist-tags": { latest: "1.0.0", tagged: "1.0.0" },
+          versions: { "1.0.0": { ...source, dist } },
+        });
+      },
+    });
+    await write(
+      packageJson,
+      JSON.stringify({
+        name: "foo",
+        version: "1.0.0",
+        dependencies: { tagged: "tagged" },
+        trustedDependencies: ["tagged"],
+      }),
+    );
+
+    const { err, exitCode } = await run(ctx, ["install", "--registry", registry.url.href]);
+
+    expect(err).not.toContain("error:");
+    expect(await ranPreinstall(packageDir, "tagged")).toBeTrue();
+    expect(exitCode).toBe(0);
+  });
+
   test("bun add link:<name> keeps the trust of the name that the person wrote", async () => {
     using ctx = await setupTest();
     const { packageDir, packageJson } = ctx;

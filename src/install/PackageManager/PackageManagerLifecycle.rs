@@ -437,7 +437,7 @@ impl PackageManager {
         set
     }
 
-    /// Runs after resolution, before the fold of bare positionals and the clean. A tarball, folder or git package is trusted by the name of its root or workspace row, which a person is expected to have written. A row in `named_by_resolution` took that name from its package, so the package would pick its own trust. Refused when `has_trusted_dependency` says yes only through such rows, unless `--trust` covers the request. A package with no lifecycle scripts is refused too: the name is saved, and a later version can add them.
+    /// Runs after resolution, before the fold of bare positionals and the clean. A tarball, folder or git package is trusted by the name of its root or workspace row, which a person is expected to have written. A row in `named_by_resolution` took that name from its package, so the package would pick its own trust. Refused when only such rows declare the package, unless `--trust` covers the request. A package with no lifecycle scripts is refused too: the name is saved, and a later version can add them.
     #[inline]
     pub(crate) fn refuse_trust_by_own_name(&mut self) {
         if self.named_by_resolution.is_empty() {
@@ -451,7 +451,6 @@ impl PackageManager {
     fn refuse_trust_by_own_name_slow(&mut self) {
         let mut named = core::mem::take(&mut self.named_by_resolution);
         index_sort::sort_indices_unstable(&mut named, &mut |a, b| a.cmp(&b));
-        named.dedup();
 
         let lockfile: &Lockfile = &self.lockfile;
         let buf = lockfile.buffers.string_bytes.as_slice();
@@ -467,11 +466,10 @@ impl PackageManager {
         // No written name in a current package.json backs these rows: the ones Bun named, and every row of a workspace that the root no longer has (the clean drops it).
         let mut unbacked = named.clone();
         for (owner, list) in lists.iter().enumerate().skip(1) {
-            let is_member = (root_rows.begin()..root_rows.end()).any(|row| {
-                rows[row as usize].behavior.is_workspace()
-                    && resolved[row as usize] as usize == owner
-            });
-            if resolutions[owner].tag == ResolutionTag::Workspace && !is_member {
+            if resolutions[owner].tag == ResolutionTag::Workspace
+                && !(root_rows.begin()..root_rows.end())
+                    .any(|row| resolved[row as usize] as usize == owner)
+            {
                 unbacked.extend(list.begin()..list.end());
             }
         }
@@ -488,7 +486,6 @@ impl PackageManager {
             let Some(resolution) = resolutions.get(resolved[row as usize] as usize) else {
                 continue;
             };
-            let owner = lockfile.get_workspace_pkg_if_workspace_dep(row);
             let name = dep.name.slice(buf);
             // The registry names an npm package, and a workspace runs its scripts without trust.
             if !matches!(
@@ -499,9 +496,8 @@ impl PackageManager {
                     | ResolutionTag::Git
                     | ResolutionTag::Github
                     | ResolutionTag::Symlink
-            ) || owner == invalid_package_id
-                || !lockfile.has_trusted_dependency(name, name, resolution)
-                || lockfile.has_trusted_dependency_without(name, name, resolution, &unbacked)
+            ) || !lockfile.has_trusted_dependency(name, name, resolution)
+                || lockfile.declared_by_root_or_workspace(name, resolution, &unbacked)
             {
                 continue;
             }
@@ -511,6 +507,7 @@ impl PackageManager {
             {
                 continue;
             }
+            let owner = lockfile.get_workspace_pkg_if_workspace_dep(row);
             if trust_from_args
                 && self.update_requests.iter().any(|request| {
                     !request.is_aliased
@@ -528,10 +525,9 @@ impl PackageManager {
             }
 
             let spec = bun_fmt::redacted(BStr::new(dep.version.literal.slice(buf))).to_string();
-            let manifest = match resolutions[owner as usize].tag {
-                ResolutionTag::Workspace => {
-                    let dir = resolutions[owner as usize].workspace().slice(buf);
-                    strings::concat(&[dir, b"/package.json"])
+            let manifest = match resolutions.get(owner as usize) {
+                Some(member) if member.tag == ResolutionTag::Workspace => {
+                    strings::concat(&[member.workspace().slice(buf), b"/package.json"])
                 }
                 _ => Box::from(&b"package.json"[..]),
             };
